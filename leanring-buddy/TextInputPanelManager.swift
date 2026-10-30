@@ -28,14 +28,32 @@ final class TextInputPanelManager {
     private var textInputHotKeyMonitor: TextInputHotKeyMonitor?
     private var textInputPanel: NSPanel?
     private var clickOutsideMonitor: Any?
+    private var localClickOutsideMonitor: Any?
+    private var dismissPanelObserver: NSObjectProtocol?
 
     private let textInputPanelWidth: CGFloat = 560
     private let textInputPanelHeight: CGFloat = 56
 
     init(companionManager: CompanionManager) {
         self.companionManager = companionManager
+        dismissPanelObserver = NotificationCenter.default.addObserver(
+            forName: .clickyDismissPanel, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.hideTextInputPanel(isSubmitting: true)
+            }
+        }
         self.textInputHotKeyMonitor = TextInputHotKeyMonitor { [weak self] in
             self?.toggleTextInputPanel()
+        }
+    }
+
+    func stop() {
+        hideTextInputPanel(isSubmitting: true)
+        textInputHotKeyMonitor = nil
+        if let dismissPanelObserver {
+            NotificationCenter.default.removeObserver(dismissPanelObserver)
+            self.dismissPanelObserver = nil
         }
     }
 
@@ -155,6 +173,15 @@ final class TextInputPanelManager {
     private func installClickOutsideMonitor() {
         removeClickOutsideMonitor()
 
+        localClickOutsideMonitor = NSEvent.addLocalMonitorForEvents(
+            matching: [.leftMouseDown, .rightMouseDown]
+        ) { [weak self] event in
+            if let self, event.window !== self.textInputPanel {
+                self.hideTextInputPanel()
+            }
+            return event
+        }
+
         clickOutsideMonitor = NSEvent.addGlobalMonitorForEvents(
             matching: [.leftMouseDown, .rightMouseDown]
         ) { [weak self] _ in
@@ -163,6 +190,10 @@ final class TextInputPanelManager {
     }
 
     private func removeClickOutsideMonitor() {
+        if let localClickOutsideMonitor {
+            NSEvent.removeMonitor(localClickOutsideMonitor)
+            self.localClickOutsideMonitor = nil
+        }
         if let clickOutsideMonitor {
             NSEvent.removeMonitor(clickOutsideMonitor)
             self.clickOutsideMonitor = nil

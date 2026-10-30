@@ -58,6 +58,7 @@ final class CompanionAppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        textInputPanelManager?.stop()
         companionManager.stop()
     }
 

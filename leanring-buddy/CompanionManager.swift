@@ -575,6 +575,7 @@ final class CompanionManager: ObservableObject {
     /// transcript (screenshot → model → pointing → spoken answer), so typed
     /// and spoken turns share one conversation history.
     func submitTypedInstruction(_ typedInstruction: String) {
+        guard canAcceptTypedInstruction else { return }
         let trimmedTypedInstruction = typedInstruction.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedTypedInstruction.isEmpty else {
             scheduleTransientHideIfNeeded()
@@ -590,13 +591,13 @@ final class CompanionManager: ObservableObject {
         }
 
         lastTranscript = trimmedTypedInstruction
-        print("⌨️ Companion received typed instruction: \(trimmedTypedInstruction)")
-        ClickyAnalytics.trackUserMessageSent(transcript: trimmedTypedInstruction)
+        print("⌨️ Typed instruction submitted (\(trimmedTypedInstruction.count) characters)")
         sendTranscriptToClaudeWithScreenshot(transcript: trimmedTypedInstruction, isTypedInstruction: true)
     }
 
     /// Closing an empty/cancelled composer must restore the idle overlay lifecycle.
     func cancelTypedInstruction() {
+        guard !buddyDictationManager.isDictationInProgress, currentResponseTask == nil else { return }
         voiceState = .idle
         scheduleTransientHideIfNeeded()
     }
@@ -759,7 +760,9 @@ final class CompanionManager: ObservableObject {
 
                 print("🧠 Conversation history: \(conversationHistory.count) exchanges")
 
-                ClickyAnalytics.trackAIResponseReceived(response: spokenText)
+                if !isTypedInstruction {
+                    ClickyAnalytics.trackAIResponseReceived(response: spokenText)
+                }
 
                 // Play the response via TTS. Keep the spinner (processing state)
                 // until the audio actually starts playing, then switch to responding.
