@@ -39,6 +39,8 @@ All paths below are relative to this repository root:
 
 ### Backend coordination contract
 
+The frozen contract for the Gemma backend is `tasks/contract.md`. It covers the auth header, limits, error shapes, ownership, and the local `defaults write` setup for `ClickyBackendBaseURL` and `ClickyAppToken`. Never commit the token. Get its value from the team's password manager, not from chat.
+
 Ask the backend teammate for the HTTPS base URL, ready routes, model/provider in use, and any required app authentication method. These are non-secret configuration details. The existing app expects:
 
 ```text
