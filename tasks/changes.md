@@ -1,0 +1,79 @@
+# Changes on `feature/gemma-backend`
+
+Branch created from published hackathon `origin/main` (02a25e6). Nothing has been pushed yet.
+
+| Commit | Task | Summary |
+| --- | --- | --- |
+| c3d5ff6 | 1 | Froze the Mac ↔ backend contract (`tasks/contract.md`); `setup.md` now points to it |
+| e09263d | 2 | Gemma adapter for `/chat`: request translation, validation, safe errors |
+| a2f45c1 | 4 | Progressive streaming that the existing Swift parser understands |
+| 4402c49 | 5 | Protected Node service for DigitalOcean |
+| (this commit) | — | `tasks/todo.md` status update and this summary |
+
+## What changed and why
+
+### Contract (`tasks/contract.md`)
+
+This is the single reference for both sides. It covers the request and response shapes, the `Authorization: Bearer <CLICKY_APP_TOKEN>` header, size and concurrency limits, the error JSON format and status codes, logging rules, configuration names and file ownership. The Mac reads `ClickyBackendBaseURL` and `ClickyAppToken` from `defaults write`, so nothing secret goes into the repository.
+
+### Gemma adapter (`worker/src/gemma.ts`)
+
+- Accepts the exact Anthropic-style body `ClaudeAPI.swift` already sends and converts it to Gemini `contents`. Assistant becomes `model`; image blocks become `inlineData`.
+- The model is pinned to `gemma-4-26b-a4b-it` on the server, and the client's `model` field is ignored. Each response carries an `x-clicky-model` header.
+- The system prompt is added to the front of the first user turn by default, because it's unconfirmed whether Gemma accepts `systemInstruction`. Setting `GEMMA_SYSTEM_PROMPT_MODE=instruction` switches modes once that's tested.
+- Validation runs before any model call: JPEG/PNG only, with magic bytes checked; at most 4 images, each 4 MB or less; body 10 MB or less; at most 40 messages; `max_tokens` clamped to 1–2048.
+- Upstream errors are mapped to safe messages (429 → `rate_limited`, others → `upstream_error`, a timeout over 90 s → `upstream_timeout`). Gemini's error body is never forwarded.
+- Thought/reasoning parts are dropped. `[POINT:…]` tags pass through unchanged.
+
+### Streaming (same file)
+
+- Gemini `streamGenerateContent?alt=sse` is re-emitted as `content_block_delta` / `text_delta` events, followed by `message_stop`.
+- The parser handles any chunk split, including inside multi-byte characters and CRLF pairs. Each delta is forwarded as soon as it completes, never buffered.
+- When the client cancels or disconnects, the upstream request is aborted. A failure mid-stream becomes an `error` event. The current Swift parser ignores that event; task 7 will make it visible.
+
+### Node service (`worker/src/server.ts`, `worker/src/main.ts`, `worker/src/speech.ts`)
+
+- `GET /health` and `HEAD /` (the client's TLS warm-up) need no token.
+- `POST /chat`, `/tts` and `/transcribe-token` require the app token. The comparison is constant-time and happens before the body is read.
+- The 10 MB body cap is enforced while the body streams in. At most 4 concurrent `/chat` requests are allowed; a slot frees when the stream ends or the client disconnects.
+- The service refuses to start without `CLICKY_APP_TOKEN`. At startup it logs which settings are present, never their values.
+- Each request produces one JSON log line: request ID, route, status, ms, image count and bytes. Prompts, images, answers, tokens and keys are never logged.
+- The speech handlers moved to `speech.ts`. Without their keys they return 503 `not_configured`, so the Mac can fall back to native speech.
+- The Cloudflare Worker entry (`src/index.ts`) uses the same Gemma and speech code but has **no auth**. Use the Node service for the demo.
+
+### Tooling (`worker/`)
+
+- `package.json` is now an ES module. New scripts: `start` (`node src/main.ts`), `build`/`typecheck` (`tsc`), `test` (Node's built-in runner, using its native TypeScript support), `smoke:gemma`.
+- Dev dependencies `typescript` and `@types/node` are installed. Node 22.18 or newer is required; I tested with 24.13.1.
+- `.env.example` lists the variable names. `worker/.env` is git-ignored.
+
+## Verification
+
+| Check | Result |
+| --- | --- |
+| `npm test` in `worker/` | 47 passed, 0 failed |
+| `npm run build` (typecheck) | Passed |
+| Local server over real HTTP, no Gemini key | `/health` 200, `HEAD /` 200, `/chat` with no token 401, authenticated `/chat` 503 `not_configured`, 11 MB body 413, `/tts` 503 `not_configured`; the token never appeared in the logs |
+| Real Gemma screenshot, streaming and POINT accuracy | **Not run.** `GEMINI_API_KEY` is not set on this PC |
+
+The tests cover every single-byte split point of a sample stream, progressive delivery, cancellation, mid-stream errors, token rejection, oversized bodies, the concurrency limit and slot release, and logs free of payloads.
+
+## How to run the real smoke test
+
+Set the key in the backend environment, or in `worker/.env`. Don't paste it into chat. Then run:
+
+```bash
+cd worker
+npm run smoke:gemma               # system prompt prepended (default)
+npm run smoke:gemma instruction   # tests whether Gemma accepts systemInstruction
+```
+
+The script draws a synthetic 640×400 screen with one red button at a known position. It then reports the answer, whether the POINT tag lands inside the button, the time to the first streamed delta and whether `message_stop` arrived.
+
+## Still to do
+
+- **Task 2:** Run the smoke test above. If `instruction` mode works, consider making it the default.
+- **Task 3 (Mac teammate):** Xcode build, permissions and Apple Speech check.
+- **Task 6:** Before provisioning anything, decide the DigitalOcean region, size, monthly cost and HTTPS hostname/TLS approach. Supply `GEMINI_API_KEY` and `CLICKY_APP_TOKEN` through the platform's secret store.
+- **Task 7:** `ClaudeAPI.swift` doesn't send the `Authorization` header yet. Until it does, the deployed backend will answer 401. The app should also read `ClickyBackendBaseURL`/`ClickyAppToken`, show Gemma instead of the Claude picker, and surface stream `error` events.
+- **Team review:** Have the Mac teammate review `tasks/contract.md` (the checkpoint after task 5).
