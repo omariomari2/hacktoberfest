@@ -539,6 +539,56 @@ final class CompanionManager: ObservableObject {
         }
     }
 
+    // MARK: - Typed Instructions
+
+    /// Whether the text-input hotkey should open the box right now. A typed
+    /// instruction still needs a screenshot, so it requires the same setup as
+    /// push-to-talk, and it shouldn't interrupt an in-progress recording.
+    var canAcceptTypedInstruction: Bool {
+        hasCompletedOnboarding
+            && allPermissionsGranted
+            && !showOnboardingVideo
+            && !buddyDictationManager.isDictationInProgress
+    }
+
+    /// Called when the text-input box opens. Mirrors pressing push-to-talk:
+    /// stops any answer being spoken, clears a previous pointer target, and
+    /// closes the menu bar panel so it doesn't cover the screen.
+    func prepareForTypedInstruction() {
+        transientHideTask?.cancel()
+        transientHideTask = nil
+
+        currentResponseTask?.cancel()
+        elevenLabsTTSClient.stopPlayback()
+        clearDetectedElementLocation()
+
+        NotificationCenter.default.post(name: .clickyDismissPanel, object: nil)
+    }
+
+    /// Sends a typed instruction through exactly the same pipeline as a voice
+    /// transcript (screenshot → model → pointing → spoken answer), so typed
+    /// and spoken turns share one conversation history.
+    func submitTypedInstruction(_ typedInstruction: String) {
+        let trimmedTypedInstruction = typedInstruction.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedTypedInstruction.isEmpty else {
+            scheduleTransientHideIfNeeded()
+            return
+        }
+
+        // If the cursor is hidden, bring it back transiently so the answer
+        // can still point at things, the same way push-to-talk does.
+        if !isClickyCursorEnabled && !isOverlayVisible {
+            overlayWindowManager.hasShownOverlayBefore = true
+            overlayWindowManager.showOverlay(onScreens: NSScreen.screens, companionManager: self)
+            isOverlayVisible = true
+        }
+
+        lastTranscript = trimmedTypedInstruction
+        print("⌨️ Companion received typed instruction: \(trimmedTypedInstruction)")
+        ClickyAnalytics.trackUserMessageSent(transcript: trimmedTypedInstruction)
+        sendTranscriptToClaudeWithScreenshot(transcript: trimmedTypedInstruction)
+    }
+
     // MARK: - Companion Prompt
 
     private static let companionVoiceResponseSystemPrompt = """
