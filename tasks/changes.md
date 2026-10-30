@@ -8,7 +8,20 @@ Branch created from published hackathon `origin/main` (02a25e6). Nothing has bee
 | e09263d | 2 | Gemma adapter for `/chat`: request translation, validation, safe errors |
 | a2f45c1 | 4 | Progressive streaming that the existing Swift parser understands |
 | 4402c49 | 5 | Protected Node service for DigitalOcean |
-| (this commit) | — | `tasks/todo.md` status update and this summary |
+| (docs) | — | This summary; `tasks/todo.md` is left as the original plan |
+
+## Task status against `tasks/todo.md`
+
+| Task | Status |
+| --- | --- |
+| 1. Branch and contract | Done. Mac teammate review of the contract is still pending |
+| 2. Gemma screenshot response | Code and unit tests done. Real-image smoke test **blocked** on `GEMINI_API_KEY` |
+| 3. Mac baseline | Not started (Mac teammate) |
+| 4. Streaming | Done. Checked against a test copy of the Swift parser; still needs a check on the Mac |
+| 5. Protected Node service | Done and verified locally |
+| 6. DigitalOcean deployment | Not started; needs cost, region and hostname decisions |
+| 7. Mac ↔ hosted Gemma | Not started |
+| 8. Voice output and handoff | Not started |
 
 ## What changed and why
 

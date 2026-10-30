@@ -1,6 +1,6 @@
 # Clicky integration tasks
 
-Status (2026-10-30): tasks 1, 4 and 5 done on `feature/gemma-backend`; task 2 done except the real-image smoke test, which needs `GEMINI_API_KEY` in the backend environment. Tasks 3, 6, 7 and 8 are pending. Details: `tasks/changes.md`.
+Status: planning complete; implementation not started. Every task below is pending.
 
 ## Task 1: Clean implementation branch and agree contract
 
@@ -11,13 +11,12 @@ Status (2026-10-30): tasks 1, 4 and 5 done on `feature/gemma-backend`; task 2 do
 **Estimated scope:** Small: 1–2 docs; 10–15 minutes
 
 **Acceptance criteria:**
-- [x] Fetch hackathon main and create feature/gemma-backend from the published clean history; preserve dirty work and original local main.
-- [x] Record /chat request and SSE/nonstream response shapes, error semantics, auth header, limits and Mac/backend ownership.
-- [x] Document local-only token configuration without committing a credential.
+- [ ] Fetch hackathon main and create feature/gemma-backend from the published clean history; preserve dirty work and original local main.
+- [ ] Record /chat request and SSE/nonstream response shapes, error semantics, auth header, limits and Mac/backend ownership.
+- [ ] Document local-only token configuration without committing a credential.
 
 **Verification:**
-- [x] Compare branch ancestry with hackathon/main; inspect actual ClaudeAPI parser. Never merge original main into the clean branch.
-- [ ] Review contract (`tasks/contract.md`) with Mac teammate — pending.
+- [ ] Compare branch ancestry with hackathon/main; inspect actual ClaudeAPI parser; review contract with Mac teammate. Never merge original main into the clean branch.
 
 ## Task 2: Prove Gemma screenshot response
 
@@ -28,14 +27,12 @@ Status (2026-10-30): tasks 1, 4 and 5 done on `feature/gemma-backend`; task 2 do
 **Estimated scope:** Medium: 3 files; 25–40 minutes
 
 **Acceptance criteria:**
-- [x] Translate existing system, history, text and JPEG/PNG image blocks; server pins gemma-4-26b-a4b-it.
-- [x] Return existing nonstreaming content text shape and preserve valid POINT tags; omit thought parts.
-- [x] Unsupported images and provider errors return safe messages.
-- [ ] BLOCKED (needs `GEMINI_API_KEY`): a real harmless labeled screenshot yields a relevant answer. Run `npm run smoke:gemma` in `worker/`.
+- [ ] Translate existing system, history, text and JPEG/PNG image blocks; server pins gemma-4-26b-a4b-it.
+- [ ] Return existing nonstreaming content text shape and preserve valid POINT tags; omit thought parts.
+- [ ] A real harmless labeled screenshot yields a relevant answer; unsupported images and provider errors return safe messages.
 
 **Verification:**
-- [x] Focused unit tests with captured input shapes: `npm test` in `worker/` (Node built-in runner, native TypeScript).
-- [ ] Real image smoke request: `npm run smoke:gemma` — not yet run.
+- [ ] Focused unit tests with captured input shapes plus one real image smoke request. Record actual command once test tooling is introduced; proposed Node test runner with TypeScript execution configured in task 1/2. Do not call it passed until executed.
 
 ## Task 3: Build Mac baseline and verify input
 
@@ -66,12 +63,12 @@ Status (2026-10-30): tasks 1, 4 and 5 done on `feature/gemma-backend`; task 2 do
 **Estimated scope:** Small: 2 files; 25–40 minutes
 
 **Acceptance criteria:**
-- [x] Consume Gemini streaming events across arbitrary network chunk boundaries and emit actual progressive text_delta SSE events.
-- [x] Honor cancellation, end of stream, Unicode and provider errors without exposing secrets or reasoning parts.
-- [x] Existing Swift parser accumulates the same visible text as the nonstreaming path (verified with a test that mirrors the Swift parser; the Mac check is part of task 7).
+- [ ] Consume Gemini streaming events across arbitrary network chunk boundaries and emit actual progressive text_delta SSE events.
+- [ ] Honor cancellation, end of stream, Unicode and provider errors without exposing secrets or reasoning parts.
+- [ ] Existing Swift parser accumulates the same visible text as the nonstreaming path.
 
 **Verification:**
-- [x] Focused fragmented-SSE fixtures including multiple events/chunk, split JSON, Unicode, cancellation and errors. Confirm progressive delivery, not buffered output relabeled as streaming.
+- [ ] Focused fragmented-SSE fixtures including multiple events/chunk, split JSON, Unicode, cancellation and errors. Confirm progressive delivery, not buffered output relabeled as streaming.
 
 ## Task 5: Run protected Node backend locally
 
@@ -82,12 +79,12 @@ Status (2026-10-30): tasks 1, 4 and 5 done on `feature/gemma-backend`; task 2 do
 **Estimated scope:** Medium: 4 files; 25–40 minutes
 
 **Acceptance criteria:**
-- [x] Provide Node start/build/test commands and GET /health plus HEAD / support for client TLS warmup.
-- [x] Require demo app token on expensive routes; enforce agreed body/image sizes, timeout and bounded concurrency.
-- [x] Missing optional speech credentials produce controlled errors; logs contain only request ID, timing and status, not payloads/keys.
+- [ ] Provide Node start/build/test commands and GET /health plus HEAD / support for client TLS warmup.
+- [ ] Require demo app token on expensive routes; enforce agreed body/image sizes, timeout and bounded concurrency.
+- [ ] Missing optional speech credentials produce controlled errors; logs contain only request ID, timing and status, not payloads/keys.
 
 **Verification:**
-- [x] Run focused server tests and production build; curl health and authenticated /chat locally. Assert unauthenticated request is rejected and oversized input fails before model invocation.
+- [ ] Run focused server tests and production build; curl health and authenticated /chat locally. Assert unauthenticated request is rejected and oversized input fails before model invocation.
 
 ### Checkpoint after task 5
 - [ ] Review actual evidence and unresolved blockers with the team before the next stage.
