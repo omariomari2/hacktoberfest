@@ -56,6 +56,52 @@ nonisolated struct ComputerUsePendingClick {
     func hasExpired(asOf currentDate: Date) -> Bool {
         currentDate.timeIntervalSince(createdDate) > Self.confirmationWindowInSeconds
     }
+
+    /// The same click with its confirmation window starting over at
+    /// `restartDate`. Used once Coach finishes speaking the question, so a
+    /// long spoken answer doesn't eat into the time the user has to say "yes".
+    func restartingConfirmationWindow(at restartDate: Date) -> ComputerUsePendingClick {
+        ComputerUsePendingClick(
+            clickKind: clickKind,
+            elementLabel: elementLabel,
+            appKitGlobalLocation: appKitGlobalLocation,
+            createdDate: restartDate
+        )
+    }
+}
+
+/// Apps where an accidental click could change security or privacy
+/// settings, reveal credentials, or approve an authentication prompt.
+nonisolated enum ComputerUseSensitiveApplications {
+
+    static let exactBundleIdentifiers: Set<String> = [
+        "com.apple.systempreferences",      // System Settings
+        "com.apple.keychainaccess",         // Keychain Access
+        "com.apple.Passwords",              // Passwords (macOS 15+)
+        "com.apple.SecurityAgent",          // System authentication dialogs
+        "com.1password.1password",
+        "com.agilebits.onepassword7",
+        "com.bitwarden.desktop",
+    ]
+
+    /// System Settings panes run in their own extension processes (for
+    /// example "com.apple.settings.PrivacySecurity.extension"), so the
+    /// element under the click can belong to a process whose bundle
+    /// identifier is not "com.apple.systempreferences" itself.
+    static let bundleIdentifierPrefixes: [String] = [
+        "com.apple.systempreferences.",
+        "com.apple.settings.",
+    ]
+
+    static func isSensitive(bundleIdentifier: String) -> Bool {
+        if exactBundleIdentifiers.contains(bundleIdentifier) {
+            return true
+        }
+        let lowercasedBundleIdentifier = bundleIdentifier.lowercased()
+        return bundleIdentifierPrefixes.contains { bundleIdentifierPrefix in
+            lowercasedBundleIdentifier.hasPrefix(bundleIdentifierPrefix)
+        }
+    }
 }
 
 nonisolated enum ComputerUseTagParser {
@@ -71,8 +117,12 @@ nonisolated enum ComputerUseTagParser {
     /// left, double or right, and both the label and :screenN are optional.
     /// Only a tag at the very end of the response counts, matching how
     /// [POINT:...] tags are parsed, so a tag quoted mid-sentence is never acted on.
+    /// The one exception is a [POINT:...] tag right after the click tag: the
+    /// base prompt tells the model to always end with a point tag, so it
+    /// sometimes writes "[CLICK:...] [POINT:none]". That trailing point tag
+    /// is removed together with the click tag.
     static func parseClickRequest(from responseText: String) -> ClickTagParseResult {
-        let pattern = #"\[CLICK:(left|double|right):(\d+)\s*,\s*(\d+)(?::([^\]:]+?))?(?::screen(\d+))?\]\s*$"#
+        let pattern = #"\[CLICK:(left|double|right):(\d+)\s*,\s*(\d+)(?::([^\]:]+?))?(?::screen(\d+))?\](?:\s*\[POINT:[^\]]*\])?\s*$"#
 
         guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]),
               let match = regex.firstMatch(in: responseText, range: NSRange(responseText.startIndex..., in: responseText)),
@@ -117,6 +167,27 @@ nonisolated enum ComputerUseTagParser {
                 screenNumber: screenNumber
             )
         )
+    }
+
+    /// Removes any [CLICK:...] or [POINT:...] tag text still left after the
+    /// trailing tags were parsed, for example a tag the model wrote
+    /// mid-sentence. Tag syntax should never be read aloud or saved to the
+    /// conversation history. This only cleans the text; a stray tag is
+    /// never acted on.
+    static func removingStrayCoordinateTags(from responseText: String) -> String {
+        // [ \t]* also removes the space before the tag, so "like [POINT:none] this"
+        // becomes "like this" rather than "like  this".
+        let strayTagPattern = #"[ \t]*\[(?:CLICK|POINT):[^\]]*\]"#
+        guard let strayTagRegex = try? NSRegularExpression(pattern: strayTagPattern, options: [.caseInsensitive]) else {
+            return responseText
+        }
+        let textWithoutStrayTags = strayTagRegex.stringByReplacingMatches(
+            in: responseText,
+            options: [],
+            range: NSRange(responseText.startIndex..., in: responseText),
+            withTemplate: ""
+        )
+        return textWithoutStrayTags.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
 
@@ -165,7 +236,8 @@ nonisolated enum ScreenCoordinateConversion {
     /// Converts a coordinate in a screenshot's pixel space (top-left origin,
     /// e.g. 1280x831) into global AppKit coordinates (bottom-left origin of
     /// the primary display, in points) for the display that screenshot shows.
-    /// Coordinates outside the screenshot are clamped to its edges.
+    /// Coordinates outside the screenshot are clamped to its edges, and the
+    /// result always lies strictly inside `displayFrame`.
     static func appKitGlobalLocation(
         screenshotCoordinate: CGPoint,
         screenshotWidthInPixels: CGFloat,
@@ -185,11 +257,24 @@ nonisolated enum ScreenCoordinateConversion {
         let appKitY = displayHeightInPoints - displayLocalY
 
         // Convert display-local coords to global screen coords
+        let globalX = displayLocalX + displayFrame.origin.x
+        let globalY = appKitY + displayFrame.origin.y
+
+        // NSScreen.frame.contains (CGRect.contains) treats the maxX and maxY
+        // edges as outside the display. The top row of the screenshot
+        // (y = 0, where the menu bar is) lands exactly on maxY, so without
+        // this a menu-bar click would be refused as off-screen. Keep the
+        // point one point inside those two edges.
+        let largestGlobalXInsideDisplay = displayFrame.maxX - Self.insetFromMaxEdgesInPoints
+        let largestGlobalYInsideDisplay = displayFrame.maxY - Self.insetFromMaxEdgesInPoints
         return CGPoint(
-            x: displayLocalX + displayFrame.origin.x,
-            y: appKitY + displayFrame.origin.y
+            x: min(globalX, largestGlobalXInsideDisplay),
+            y: min(globalY, largestGlobalYInsideDisplay)
         )
     }
+
+    /// How far inside the display's right and top edges a converted point is kept.
+    private static let insetFromMaxEdgesInPoints: CGFloat = 1
 
     /// Converts global AppKit coordinates (bottom-left origin) into global
     /// CoreGraphics coordinates (top-left origin of the primary display),

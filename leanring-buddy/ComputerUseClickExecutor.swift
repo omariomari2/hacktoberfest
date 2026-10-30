@@ -18,6 +18,10 @@ nonisolated enum ComputerUseClickRefusal: Error, Equatable {
     case targetOutsideAllDisplays
     case secureTextFieldAtTarget
     case sensitiveApplicationAtTarget(applicationName: String)
+    /// The Accessibility API couldn't say what is under the target (no
+    /// answer, a timeout, or it only saw Coach's own windows), so the
+    /// password-field and sensitive-app checks couldn't run.
+    case targetElementCouldNotBeVerified
     case mouseEventCreationFailed
 
     var spokenExplanation: String {
@@ -30,6 +34,8 @@ nonisolated enum ComputerUseClickRefusal: Error, Equatable {
             return "that's a password field, so i won't click it for you."
         case .sensitiveApplicationAtTarget(let applicationName):
             return "i don't click inside \(applicationName), so you'll want to do that one yourself."
+        case .targetElementCouldNotBeVerified:
+            return "i couldn't check what's under that spot, so i didn't click."
         case .mouseEventCreationFailed:
             return "something went wrong creating the click, so nothing was clicked."
         }
@@ -38,29 +44,30 @@ nonisolated enum ComputerUseClickRefusal: Error, Equatable {
 
 enum ComputerUseClickExecutor {
 
-    /// Apps where an accidental click could change security or privacy
-    /// settings, reveal credentials, or approve an authentication prompt.
-    static let sensitiveApplicationBundleIdentifiers: Set<String> = [
-        "com.apple.systempreferences",      // System Settings
-        "com.apple.keychainaccess",         // Keychain Access
-        "com.apple.Passwords",              // Passwords (macOS 15+)
-        "com.apple.SecurityAgent",          // System authentication dialogs
-        "com.1password.1password",
-        "com.agilebits.onepassword7",
-        "com.bitwarden.desktop",
-    ]
-
     /// Short pauses between synthetic events. Some apps ignore a mouse-down
     /// that arrives in the same instant as the move, and double-clicks need
     /// two distinct click pairs.
     private static let delayAfterMovingCursorInNanoseconds: UInt64 = 60_000_000
     private static let delayBetweenDoubleClickPairsInNanoseconds: UInt64 = 40_000_000
 
+    /// How long to wait after taking Coach's overlay windows off screen
+    /// before the Accessibility hit test. AppKit can batch window ordering
+    /// until the run loop turns, so this gives the window server time to
+    /// actually remove the overlay.
+    private static let delayForOverlayToLeaveScreenInNanoseconds: UInt64 = 50_000_000
+
+    /// How long one Accessibility request may wait for the target app to
+    /// answer. The default is about six seconds, and these calls run on the
+    /// main actor, so a beach-balling app would otherwise freeze Coach.
+    /// A timed-out request refuses the click.
+    private static let accessibilityMessagingTimeoutInSeconds: Float = 1.0
+
     /// Moves the real mouse cursor to the target and performs the click.
     /// Throws a ComputerUseClickRefusal (without clicking) if any safety check fails.
     static func performClick(
         clickKind: ComputerUseClickKind,
-        atAppKitGlobalLocation appKitGlobalLocation: CGPoint
+        atAppKitGlobalLocation appKitGlobalLocation: CGPoint,
+        overlayWindowManager: OverlayWindowManager
     ) async throws {
         guard AXIsProcessTrusted() else {
             throw ComputerUseClickRefusal.accessibilityPermissionMissing
@@ -79,8 +86,22 @@ enum ComputerUseClickExecutor {
             primaryDisplayHeightInPoints: primaryDisplayHeightInPoints
         )
 
-        if let refusal = refusalForElementAtTarget(coreGraphicsLocation: coreGraphicsLocation) {
-            throw refusal
+        // Coach's full-screen overlay sits above every other window. It is
+        // click-through, but the Accessibility hit test can still land on it
+        // and then never see the real element underneath. Take the overlay
+        // off screen only while the check runs, then put it back.
+        overlayWindowManager.temporarilyHideOverlayWindows()
+        do {
+            try await Task.sleep(nanoseconds: delayForOverlayToLeaveScreenInNanoseconds)
+        } catch {
+            overlayWindowManager.restoreTemporarilyHiddenOverlayWindows()
+            throw error
+        }
+        let refusalForTargetElement = refusalForElementAtTarget(coreGraphicsLocation: coreGraphicsLocation)
+        overlayWindowManager.restoreTemporarilyHiddenOverlayWindows()
+
+        if let refusalForTargetElement {
+            throw refusalForTargetElement
         }
 
         let eventSource = CGEventSource(stateID: .hidSystemState)
@@ -127,8 +148,14 @@ enum ComputerUseClickExecutor {
 
     /// Uses the Accessibility API to look at what is actually under the
     /// target point right now, and refuses password fields and sensitive apps.
+    /// Fails closed: whenever the element under the point can't be
+    /// identified, the click is refused instead of performed unchecked.
     private static func refusalForElementAtTarget(coreGraphicsLocation: CGPoint) -> ComputerUseClickRefusal? {
         let systemWideAccessibilityElement = AXUIElementCreateSystemWide()
+        // Set on the system-wide element, the timeout applies to every
+        // Accessibility request this app makes, including the hit test below.
+        _ = AXUIElementSetMessagingTimeout(systemWideAccessibilityElement, accessibilityMessagingTimeoutInSeconds)
+
         var elementAtTarget: AXUIElement?
         let elementLookupResult = AXUIElementCopyElementAtPosition(
             systemWideAccessibilityElement,
@@ -136,33 +163,54 @@ enum ComputerUseClickExecutor {
             Float(coreGraphicsLocation.y),
             &elementAtTarget
         )
-
-        var targetProcessIdentifier: pid_t = 0
-        if elementLookupResult == .success, let elementAtTarget {
-            var subroleValue: CFTypeRef?
-            let subroleLookupResult = AXUIElementCopyAttributeValue(
-                elementAtTarget,
-                kAXSubroleAttribute as CFString,
-                &subroleValue
-            )
-            if subroleLookupResult == .success,
-               let subrole = subroleValue as? String,
-               subrole == kAXSecureTextFieldSubrole {
-                return .secureTextFieldAtTarget
-            }
-            AXUIElementGetPid(elementAtTarget, &targetProcessIdentifier)
+        // No answer (including a timeout from a hung app) means we can't rule
+        // out a password field or a sensitive app.
+        guard elementLookupResult == .success, let elementAtTarget else {
+            return .targetElementCouldNotBeVerified
         }
 
-        // Our own overlay sits above everything (click-through), so if the
-        // hit test lands on our process, judge by the frontmost app instead.
-        let isTargetOurOwnProcess = targetProcessIdentifier == ProcessInfo.processInfo.processIdentifier
-        let targetApplication: NSRunningApplication? = (targetProcessIdentifier != 0 && !isTargetOurOwnProcess)
-            ? NSRunningApplication(processIdentifier: targetProcessIdentifier)
-            : NSWorkspace.shared.frontmostApplication
+        var targetProcessIdentifier: pid_t = 0
+        let processIdentifierLookupResult = AXUIElementGetPid(elementAtTarget, &targetProcessIdentifier)
+        guard processIdentifierLookupResult == .success, targetProcessIdentifier != 0 else {
+            return .targetElementCouldNotBeVerified
+        }
 
-        if let targetBundleIdentifier = targetApplication?.bundleIdentifier,
-           sensitiveApplicationBundleIdentifiers.contains(targetBundleIdentifier) {
-            let applicationName = targetApplication?.localizedName ?? "that app"
+        // If the hit test still landed on one of Coach's own windows (the
+        // overlay, or the menu bar panel), the real element underneath was
+        // never checked. Never treat that as safe. This is checked before
+        // reading any attribute, because asking our own process for its
+        // attributes while the main actor is busy here would only time out.
+        guard targetProcessIdentifier != ProcessInfo.processInfo.processIdentifier else {
+            return .targetElementCouldNotBeVerified
+        }
+
+        _ = AXUIElementSetMessagingTimeout(elementAtTarget, accessibilityMessagingTimeoutInSeconds)
+        var subroleValue: CFTypeRef?
+        let subroleLookupResult = AXUIElementCopyAttributeValue(
+            elementAtTarget,
+            kAXSubroleAttribute as CFString,
+            &subroleValue
+        )
+        switch subroleLookupResult {
+        case .success:
+            if let subrole = subroleValue as? String, subrole == kAXSecureTextFieldSubrole {
+                return .secureTextFieldAtTarget
+            }
+        case .noValue, .attributeUnsupported:
+            // Most elements have no subrole. That is a definite answer, not a failure.
+            break
+        default:
+            // A timeout or any other error: we don't know whether it's a password field.
+            return .targetElementCouldNotBeVerified
+        }
+
+        guard let targetApplication = NSRunningApplication(processIdentifier: targetProcessIdentifier) else {
+            return .targetElementCouldNotBeVerified
+        }
+
+        if let targetBundleIdentifier = targetApplication.bundleIdentifier,
+           ComputerUseSensitiveApplications.isSensitive(bundleIdentifier: targetBundleIdentifier) {
+            let applicationName = targetApplication.localizedName ?? "that app"
             return .sensitiveApplicationAtTarget(applicationName: applicationName)
         }
 
