@@ -88,7 +88,7 @@ Use harmless demo content. Include the first relevant sanitized error and reprod
 
 ## Current state
 
-This checkout is the MIT-licensed macOS Clicky source, based on [farzaa/clicky](https://github.com/farzaa/clicky). Keep the upstream LICENSE and attribution when publishing our changes.
+This checkout is the MIT-licensed macOS Clicky source, based on [the upstream Clicky project](https://github.com/farzaa/clicky). Keep the upstream LICENSE and attribution when publishing our changes.
 
 | Component | Current status |
 | --- | --- |

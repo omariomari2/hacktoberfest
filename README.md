@@ -1,5 +1,7 @@
 # HeyCoach
 
+Built by **the winning team**.
+
 A macOS screen companion powered by Gemma. Hold **Control + Option**, say **Hey Coach**, and ask about what is on your screen. HeyCoach explains and points to relevant controls.
 
 ## Run on your Mac
@@ -38,4 +40,4 @@ Requires Node 22.18 or newer. Configuration names are in `worker/.env.example`. 
 
 ## Credits and license
 
-HeyCoach is a hackathon adaptation of [Clicky by Farza and contributors](https://github.com/farzaa/clicky), released under the [MIT license](LICENSE). Preserve the upstream copyright and license notices. Upstream HeyClicky downloads are a separate product.
+HeyCoach is a hackathon adaptation of [the upstream Clicky project](https://github.com/farzaa/clicky), released under the [MIT license](LICENSE). Preserve the upstream copyright and license notices. Upstream HeyClicky downloads are a separate product.

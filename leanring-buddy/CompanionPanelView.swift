@@ -62,7 +62,7 @@ struct CompanionPanelView: View {
                 Spacer()
                     .frame(height: 16)
 
-                dmFarzaButton
+                winningTeamFeedbackButton
                     .padding(.horizontal, 16)
             }
 
@@ -641,9 +641,9 @@ struct CompanionPanelView: View {
         .pointerCursor()
     }
 
-    // MARK: - DM Farza Button
+    // MARK: - The Winning Team Feedback
 
-    private var dmFarzaButton: some View {
+    private var winningTeamFeedbackButton: some View {
         Button(action: {
             if let url = URL(string: "https://github.com/omariomari2/hacktoberfest/issues") {
                 NSWorkspace.shared.open(url)
@@ -654,9 +654,9 @@ struct CompanionPanelView: View {
                     .font(.system(size: 12, weight: .medium))
 
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("HeyCoach feedback")
+                    Text("Contact the winning team")
                         .font(.system(size: 12, weight: .semibold))
-                    Text("Report a bug or share an idea with our team.")
+                    Text("Report a bug or share an idea with the winning team.")
                         .font(.system(size: 10))
                         .foregroundColor(DS.Colors.textTertiary)
                 }
