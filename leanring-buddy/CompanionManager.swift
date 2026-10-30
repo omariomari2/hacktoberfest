@@ -88,6 +88,29 @@ final class CompanionManager: ObservableObject {
     /// speaks again so a new response can begin immediately.
     private var currentResponseTask: Task<Void, Never>?
 
+    // MARK: - Computer Use
+
+    /// Computer use (the model clicking for the user) is off unless explicitly
+    /// enabled on this Mac, because it acts on the user's behalf:
+    ///   defaults write com.yourcompany.leanring-buddy isComputerUseEnabled -bool true
+    /// When off, the prompt never mentions clicking and [CLICK:...] tags are ignored.
+    private var isComputerUseEnabled: Bool {
+        UserDefaults.standard.bool(forKey: "isComputerUseEnabled")
+    }
+
+    /// A click the model proposed that is waiting for the user to say "yes".
+    /// Any other utterance, or waiting too long, discards it without clicking.
+    private var pendingComputerUseClick: ComputerUsePendingClick?
+
+    /// Waits for Coach to finish speaking the click question, then restarts
+    /// the pending click's confirmation window. Cancelled when the user
+    /// speaks again, since that utterance decides the pending click.
+    private var computerUseConfirmationWindowRestartTask: Task<Void, Never>?
+
+    /// Speaks computer-use status lines when ElevenLabs is unavailable. Kept
+    /// as a property so the synthesizer isn't deallocated mid-sentence.
+    private let computerUseFallbackSpeechSynthesizer = NSSpeechSynthesizer()
+
     private var shortcutTransitionCancellable: AnyCancellable?
     private var voiceStateCancellable: AnyCancellable?
     private var audioPowerCancellable: AnyCancellable?
@@ -295,6 +318,9 @@ final class CompanionManager: ObservableObject {
 
         currentResponseTask?.cancel()
         currentResponseTask = nil
+        pendingComputerUseClick = nil
+        computerUseConfirmationWindowRestartTask?.cancel()
+        computerUseConfirmationWindowRestartTask = nil
         shortcutTransitionCancellable?.cancel()
         voiceStateCancellable?.cancel()
         audioPowerCancellable?.cancel()
@@ -577,6 +603,26 @@ final class CompanionManager: ObservableObject {
     - element is on screen 2 (not where cursor is): "that's over on your other monitor — see the terminal window? [POINT:400,300:terminal:screen2]"
     """
 
+    /// Appended to the system prompt only when computer use is enabled.
+    private static let computerUseSystemPromptAddition = """
+
+
+    clicking for the user:
+    you can also click for the user, but only when they explicitly ask you to do it for them — like "click that", "open it for me", "double click the file", or "right click it". if they only ask where something is or how to do something, point instead of clicking.
+
+    to click, end your response with a click tag INSTEAD of a point tag: [CLICK:kind:x,y:label] where kind is left, double, or right. use the same coordinate rules as pointing, including :screenN at the end when the element is on a different screen. use double for opening files and folders in finder, and right to open a context menu. request at most one click per response.
+
+    when you click, the click tag replaces the point tag. do NOT also append [POINT:...] or [POINT:none] — the click tag must be the very last thing in your response.
+
+    in your spoken text, say plainly what you're about to click. the app will ask the user to confirm before anything is clicked, so don't claim you already clicked it.
+
+    never request clicks in password fields, payment or checkout pages, system settings, or security and permission prompts — explain where to click instead.
+
+    examples:
+    - user says "open the downloads folder for me" and it's in the finder sidebar: "i'll open your downloads folder from the sidebar. [CLICK:left:88,214:downloads]"
+    - user says "double click the report pdf": "i'll open report dot pdf for you. [CLICK:double:640,388:report pdf]"
+    """
+
     // MARK: - AI Response Pipeline
 
     /// Captures a screenshot, sends it along with the transcript to Claude,
@@ -587,6 +633,25 @@ final class CompanionManager: ObservableObject {
     private func sendTranscriptToClaudeWithScreenshot(transcript: String) {
         currentResponseTask?.cancel()
         elevenLabsTTSClient.stopPlayback()
+        computerUseConfirmationWindowRestartTask?.cancel()
+        computerUseConfirmationWindowRestartTask = nil
+
+        // A pending click is only performed if this utterance is a plain "yes"
+        // within the confirmation window, and computer use is still enabled
+        // (it can be turned off while a click is waiting). Anything else
+        // discards it and is handled as a normal new question.
+        if let pendingComputerUseClick {
+            self.pendingComputerUseClick = nil
+            let isStillWithinConfirmationWindow = !pendingComputerUseClick.hasExpired(asOf: Date())
+            let isComputerUseStillEnabled = isComputerUseEnabled
+            if isComputerUseStillEnabled
+                && isStillWithinConfirmationWindow
+                && ComputerUseConfirmation.isConfirmation(transcript) {
+                performConfirmedComputerUseClick(pendingComputerUseClick, confirmationTranscript: transcript)
+                return
+            }
+            print("🖱️ Pending click discarded (expired: \(!isStillWithinConfirmationWindow), computer use enabled: \(isComputerUseStillEnabled))")
+        }
 
         currentResponseTask = Task {
             // Stay in processing (spinner) state — no streaming text displayed
@@ -613,7 +678,9 @@ final class CompanionManager: ObservableObject {
 
                 let (fullResponseText, _) = try await claudeAPI.analyzeImageStreaming(
                     images: labeledImages,
-                    systemPrompt: Self.companionVoiceResponseSystemPrompt,
+                    systemPrompt: isComputerUseEnabled
+                        ? Self.companionVoiceResponseSystemPrompt + Self.computerUseSystemPromptAddition
+                        : Self.companionVoiceResponseSystemPrompt,
                     conversationHistory: historyForAPI,
                     userPrompt: transcript,
                     onTextChunk: { _ in
@@ -623,15 +690,34 @@ final class CompanionManager: ObservableObject {
 
                 guard !Task.isCancelled else { return }
 
+                // Pull out a trailing [CLICK:...] tag first (only when computer
+                // use is on), then parse the remaining text for [POINT:...] as before.
+                var responseTextWithoutClickTag = fullResponseText
+                var computerUseClickRequest: ComputerUseClickRequest? = nil
+                if isComputerUseEnabled {
+                    let clickTagParseResult = ComputerUseTagParser.parseClickRequest(from: fullResponseText)
+                    responseTextWithoutClickTag = clickTagParseResult.remainingText
+                    computerUseClickRequest = clickTagParseResult.clickRequest
+                }
+
                 // Parse the [POINT:...] tag from Claude's response
-                let parseResult = Self.parsePointingCoordinates(from: fullResponseText)
-                let spokenText = parseResult.spokenText
+                let parseResult = Self.parsePointingCoordinates(from: responseTextWithoutClickTag)
+                // Any tag text still left (for example a [CLICK:...] tag that
+                // wasn't at the end, or a click tag while computer use is off)
+                // is removed so it's never spoken or saved to history.
+                var spokenText = ComputerUseTagParser.removingStrayCoordinateTags(from: parseResult.spokenText)
+
+                // A requested click is also pointed at, so the user sees the
+                // exact target before confirming it.
+                let pointingCoordinate = computerUseClickRequest?.screenshotCoordinate ?? parseResult.coordinate
+                let pointingScreenNumber = computerUseClickRequest != nil ? computerUseClickRequest?.screenNumber : parseResult.screenNumber
+                let pointingElementLabel = computerUseClickRequest != nil ? computerUseClickRequest?.elementLabel : parseResult.elementLabel
 
                 // Handle element pointing if Claude returned coordinates.
                 // Switch to idle BEFORE setting the location so the triangle
                 // becomes visible and can fly to the target. Without this, the
                 // spinner hides the triangle and the flight animation is invisible.
-                let hasPointCoordinate = parseResult.coordinate != nil
+                let hasPointCoordinate = pointingCoordinate != nil
                 if hasPointCoordinate {
                     voiceState = .idle
                 }
@@ -639,60 +725,53 @@ final class CompanionManager: ObservableObject {
                 // Pick the screen capture matching Claude's screen number,
                 // falling back to the cursor screen if not specified.
                 let targetScreenCapture: CompanionScreenCapture? = {
-                    if let screenNumber = parseResult.screenNumber,
+                    if let screenNumber = pointingScreenNumber,
                        screenNumber >= 1 && screenNumber <= screenCaptures.count {
                         return screenCaptures[screenNumber - 1]
                     }
                     return screenCaptures.first(where: { $0.isCursorScreen })
                 }()
 
-                if let pointCoordinate = parseResult.coordinate,
+                if let pointCoordinate = pointingCoordinate,
                    let targetScreenCapture {
                     // Claude's coordinates are in the screenshot's pixel space
                     // (top-left origin, e.g. 1280x831). Scale to the display's
                     // point space (e.g. 1512x982), then convert to AppKit global coords.
-                    let screenshotWidth = CGFloat(targetScreenCapture.screenshotWidthInPixels)
-                    let screenshotHeight = CGFloat(targetScreenCapture.screenshotHeightInPixels)
-                    let displayWidth = CGFloat(targetScreenCapture.displayWidthInPoints)
-                    let displayHeight = CGFloat(targetScreenCapture.displayHeightInPoints)
-                    let displayFrame = targetScreenCapture.displayFrame
-
-                    // Clamp to screenshot coordinate space
-                    let clampedX = max(0, min(pointCoordinate.x, screenshotWidth))
-                    let clampedY = max(0, min(pointCoordinate.y, screenshotHeight))
-
-                    // Scale from screenshot pixels to display points
-                    let displayLocalX = clampedX * (displayWidth / screenshotWidth)
-                    let displayLocalY = clampedY * (displayHeight / screenshotHeight)
-
-                    // Convert from top-left origin (screenshot) to bottom-left origin (AppKit)
-                    let appKitY = displayHeight - displayLocalY
-
-                    // Convert display-local coords to global screen coords
-                    let globalLocation = CGPoint(
-                        x: displayLocalX + displayFrame.origin.x,
-                        y: appKitY + displayFrame.origin.y
+                    let globalLocation = ScreenCoordinateConversion.appKitGlobalLocation(
+                        screenshotCoordinate: pointCoordinate,
+                        screenshotWidthInPixels: CGFloat(targetScreenCapture.screenshotWidthInPixels),
+                        screenshotHeightInPixels: CGFloat(targetScreenCapture.screenshotHeightInPixels),
+                        displayWidthInPoints: CGFloat(targetScreenCapture.displayWidthInPoints),
+                        displayHeightInPoints: CGFloat(targetScreenCapture.displayHeightInPoints),
+                        displayFrame: targetScreenCapture.displayFrame
                     )
 
+                    if let computerUseClickRequest {
+                        pendingComputerUseClick = ComputerUsePendingClick(
+                            clickKind: computerUseClickRequest.clickKind,
+                            elementLabel: computerUseClickRequest.elementLabel,
+                            appKitGlobalLocation: globalLocation,
+                            createdDate: Date()
+                        )
+                        let targetDescription = computerUseClickRequest.elementLabel ?? "this"
+                        detectedElementBubbleText = "\(computerUseClickRequest.clickKind.spokenDescription) \(targetDescription)? say yes"
+                        spokenText += " say yes to confirm."
+                        print("🖱️ Click proposed: \(computerUseClickRequest.clickKind.rawValue) → \"\(targetDescription)\", awaiting confirmation")
+                    } else {
+                        detectedElementBubbleText = nil
+                    }
+
                     detectedElementScreenLocation = globalLocation
-                    detectedElementDisplayFrame = displayFrame
-                    ClickyAnalytics.trackElementPointed(elementLabel: parseResult.elementLabel)
-                    print("🎯 Element pointing: (\(Int(pointCoordinate.x)), \(Int(pointCoordinate.y))) → \"\(parseResult.elementLabel ?? "element")\"")
+                    detectedElementDisplayFrame = targetScreenCapture.displayFrame
+                    ClickyAnalytics.trackElementPointed(elementLabel: pointingElementLabel)
+                    print("🎯 Element pointing: (\(Int(pointCoordinate.x)), \(Int(pointCoordinate.y))) → \"\(pointingElementLabel ?? "element")\"")
                 } else {
-                    print("🎯 Element pointing: \(parseResult.elementLabel ?? "no element")")
+                    print("🎯 Element pointing: \(pointingElementLabel ?? "no element")")
                 }
 
                 // Save this exchange to conversation history (with the point tag
                 // stripped so it doesn't confuse future context)
-                conversationHistory.append((
-                    userTranscript: transcript,
-                    assistantResponse: spokenText
-                ))
-
-                // Keep only the last 10 exchanges to avoid unbounded context growth
-                if conversationHistory.count > 10 {
-                    conversationHistory.removeFirst(conversationHistory.count - 10)
-                }
+                appendExchangeToConversationHistory(userTranscript: transcript, assistantResponse: spokenText)
 
                 print("🧠 Conversation history: \(conversationHistory.count) exchanges")
 
@@ -711,6 +790,15 @@ final class CompanionManager: ObservableObject {
                         speakCreditsErrorFallback()
                     }
                 }
+
+                // The confirmation window should count from when Coach stops
+                // asking, not from when the answer arrived, or a long spoken
+                // answer would leave the user little time to say "yes".
+                // Skipped if the user already spoke again, since a newer
+                // response now owns any pending click.
+                if pendingComputerUseClick != nil && !Task.isCancelled {
+                    restartComputerUseConfirmationWindowWhenSpeechFinishes()
+                }
             } catch is CancellationError {
                 // User spoke again — response was interrupted
             } catch {
@@ -723,6 +811,36 @@ final class CompanionManager: ObservableObject {
                 voiceState = .idle
                 scheduleTransientHideIfNeeded()
             }
+        }
+    }
+
+    /// Appends one exchange to the conversation history sent with future
+    /// requests, keeping only the last 10 exchanges to avoid unbounded
+    /// context growth.
+    private func appendExchangeToConversationHistory(userTranscript: String, assistantResponse: String) {
+        conversationHistory.append((
+            userTranscript: userTranscript,
+            assistantResponse: assistantResponse
+        ))
+
+        if conversationHistory.count > 10 {
+            conversationHistory.removeFirst(conversationHistory.count - 10)
+        }
+    }
+
+    /// Restarts the pending click's 20-second confirmation window once
+    /// Coach's spoken question has finished playing, using the same
+    /// isPlaying polling as scheduleTransientHideIfNeeded.
+    private func restartComputerUseConfirmationWindowWhenSpeechFinishes() {
+        computerUseConfirmationWindowRestartTask?.cancel()
+        computerUseConfirmationWindowRestartTask = Task {
+            while elevenLabsTTSClient.isPlaying {
+                try? await Task.sleep(nanoseconds: 200_000_000)
+                guard !Task.isCancelled else { return }
+            }
+            guard !Task.isCancelled,
+                  let pendingClickAwaitingConfirmation = self.pendingComputerUseClick else { return }
+            self.pendingComputerUseClick = pendingClickAwaitingConfirmation.restartingConfirmationWindow(at: Date())
         }
     }
 
@@ -764,6 +882,64 @@ final class CompanionManager: ObservableObject {
         let synthesizer = NSSpeechSynthesizer()
         synthesizer.startSpeaking(utterance)
         voiceState = .responding
+    }
+
+    // MARK: - Computer Use Execution
+
+    /// Performs a click the user just confirmed out loud, then says whether
+    /// it happened. The click is never retried; a refusal is spoken instead.
+    private func performConfirmedComputerUseClick(
+        _ confirmedComputerUseClick: ComputerUsePendingClick,
+        confirmationTranscript: String
+    ) {
+        currentResponseTask = Task {
+            voiceState = .processing
+
+            let targetDescription = confirmedComputerUseClick.elementLabel ?? "that"
+            let spokenResult: String
+            do {
+                try await ComputerUseClickExecutor.performClick(
+                    clickKind: confirmedComputerUseClick.clickKind,
+                    atAppKitGlobalLocation: confirmedComputerUseClick.appKitGlobalLocation,
+                    overlayWindowManager: overlayWindowManager
+                )
+                spokenResult = "done, i \(confirmedComputerUseClick.clickKind.spokenDescription)ed \(targetDescription)."
+                print("🖱️ Click performed: \(confirmedComputerUseClick.clickKind.rawValue) → \"\(targetDescription)\"")
+            } catch let clickRefusal as ComputerUseClickRefusal {
+                spokenResult = clickRefusal.spokenExplanation
+                print("🖱️ Click refused: \(clickRefusal)")
+            } catch is CancellationError {
+                return
+            } catch {
+                spokenResult = "something went wrong, so i didn't click anything."
+                print("⚠️ Click error: \(error)")
+            }
+
+            guard !Task.isCancelled else { return }
+
+            appendExchangeToConversationHistory(userTranscript: confirmationTranscript, assistantResponse: spokenResult)
+
+            await speakComputerUseStatus(spokenResult)
+
+            if !Task.isCancelled {
+                voiceState = .idle
+                scheduleTransientHideIfNeeded()
+            }
+        }
+    }
+
+    /// Speaks a short computer-use status line. Falls back to the macOS
+    /// system voice speaking the same text if ElevenLabs is unavailable,
+    /// so the user always hears whether the click actually happened.
+    private func speakComputerUseStatus(_ statusText: String) async {
+        do {
+            try await elevenLabsTTSClient.speakText(statusText)
+            voiceState = .responding
+        } catch {
+            print("⚠️ ElevenLabs TTS error for computer-use status: \(error)")
+            computerUseFallbackSpeechSynthesizer.startSpeaking(statusText)
+            voiceState = .responding
+        }
     }
 
     // MARK: - Point Tag Parsing
@@ -997,20 +1173,14 @@ final class CompanionManager: ObservableObject {
                     return
                 }
 
-                let screenshotWidth = CGFloat(cursorScreenCapture.screenshotWidthInPixels)
-                let screenshotHeight = CGFloat(cursorScreenCapture.screenshotHeightInPixels)
-                let displayWidth = CGFloat(cursorScreenCapture.displayWidthInPoints)
-                let displayHeight = CGFloat(cursorScreenCapture.displayHeightInPoints)
                 let displayFrame = cursorScreenCapture.displayFrame
-
-                let clampedX = max(0, min(pointCoordinate.x, screenshotWidth))
-                let clampedY = max(0, min(pointCoordinate.y, screenshotHeight))
-                let displayLocalX = clampedX * (displayWidth / screenshotWidth)
-                let displayLocalY = clampedY * (displayHeight / screenshotHeight)
-                let appKitY = displayHeight - displayLocalY
-                let globalLocation = CGPoint(
-                    x: displayLocalX + displayFrame.origin.x,
-                    y: appKitY + displayFrame.origin.y
+                let globalLocation = ScreenCoordinateConversion.appKitGlobalLocation(
+                    screenshotCoordinate: pointCoordinate,
+                    screenshotWidthInPixels: CGFloat(cursorScreenCapture.screenshotWidthInPixels),
+                    screenshotHeightInPixels: CGFloat(cursorScreenCapture.screenshotHeightInPixels),
+                    displayWidthInPoints: CGFloat(cursorScreenCapture.displayWidthInPoints),
+                    displayHeightInPoints: CGFloat(cursorScreenCapture.displayHeightInPoints),
+                    displayFrame: displayFrame
                 )
 
                 // Set custom bubble text so the pointing animation uses Claude's
