@@ -87,6 +87,7 @@ final class CompanionManager: ObservableObject {
     /// The currently running AI response task, if any. Cancelled when the user
     /// speaks again so a new response can begin immediately.
     private var currentResponseTask: Task<Void, Never>?
+    private let typedResponseSpeechSynthesizer = NSSpeechSynthesizer()
 
     private var shortcutTransitionCancellable: AnyCancellable?
     private var voiceStateCancellable: AnyCancellable?
@@ -288,6 +289,7 @@ final class CompanionManager: ObservableObject {
     }
 
     func stop() {
+        typedResponseSpeechSynthesizer.stopSpeaking()
         globalPushToTalkShortcutMonitor.stop()
         buddyDictationManager.cancelCurrentDictation()
         overlayWindowManager.hideOverlay()
@@ -494,6 +496,7 @@ final class CompanionManager: ObservableObject {
             // Cancel any in-progress response and TTS from a previous utterance
             currentResponseTask?.cancel()
             elevenLabsTTSClient.stopPlayback()
+            typedResponseSpeechSynthesizer.stopSpeaking()
             clearDetectedElementLocation()
 
             // Dismiss the onboarding prompt if it's showing
@@ -559,7 +562,10 @@ final class CompanionManager: ObservableObject {
         transientHideTask = nil
 
         currentResponseTask?.cancel()
+        currentResponseTask = nil
+        voiceState = .idle
         elevenLabsTTSClient.stopPlayback()
+        typedResponseSpeechSynthesizer.stopSpeaking()
         clearDetectedElementLocation()
 
         NotificationCenter.default.post(name: .clickyDismissPanel, object: nil)
@@ -586,7 +592,13 @@ final class CompanionManager: ObservableObject {
         lastTranscript = trimmedTypedInstruction
         print("⌨️ Companion received typed instruction: \(trimmedTypedInstruction)")
         ClickyAnalytics.trackUserMessageSent(transcript: trimmedTypedInstruction)
-        sendTranscriptToClaudeWithScreenshot(transcript: trimmedTypedInstruction)
+        sendTranscriptToClaudeWithScreenshot(transcript: trimmedTypedInstruction, isTypedInstruction: true)
+    }
+
+    /// Closing an empty/cancelled composer must restore the idle overlay lifecycle.
+    func cancelTypedInstruction() {
+        voiceState = .idle
+        scheduleTransientHideIfNeeded()
     }
 
     // MARK: - Companion Prompt
@@ -634,9 +646,10 @@ final class CompanionManager: ObservableObject {
     /// the spinner/processing state until TTS audio begins playing.
     /// Claude's response may include a [POINT:x,y:label] tag which triggers
     /// the buddy to fly to that element on screen.
-    private func sendTranscriptToClaudeWithScreenshot(transcript: String) {
+    private func sendTranscriptToClaudeWithScreenshot(transcript: String, isTypedInstruction: Bool = false) {
         currentResponseTask?.cancel()
         elevenLabsTTSClient.stopPlayback()
+        typedResponseSpeechSynthesizer.stopSpeaking()
 
         currentResponseTask = Task {
             // Stay in processing (spinner) state — no streaming text displayed
@@ -758,12 +771,19 @@ final class CompanionManager: ObservableObject {
                     } catch {
                         ClickyAnalytics.trackTTSError(error: error.localizedDescription)
                         print("⚠️ ElevenLabs TTS error: \(error)")
-                        speakCreditsErrorFallback()
+                        guard !Task.isCancelled else { return }
+                        if isTypedInstruction {
+                            typedResponseSpeechSynthesizer.startSpeaking(spokenText)
+                            voiceState = .responding
+                        } else {
+                            speakCreditsErrorFallback()
+                        }
                     }
                 }
             } catch is CancellationError {
                 // User spoke again — response was interrupted
             } catch {
+                guard !Task.isCancelled else { return }
                 ClickyAnalytics.trackResponseError(error: error.localizedDescription)
                 print("⚠️ Companion response error: \(error)")
                 speakCreditsErrorFallback()
@@ -786,7 +806,7 @@ final class CompanionManager: ObservableObject {
         transientHideTask?.cancel()
         transientHideTask = Task {
             // Wait for TTS audio to finish playing
-            while elevenLabsTTSClient.isPlaying {
+            while elevenLabsTTSClient.isPlaying || typedResponseSpeechSynthesizer.isSpeaking {
                 try? await Task.sleep(nanoseconds: 200_000_000)
                 guard !Task.isCancelled else { return }
             }

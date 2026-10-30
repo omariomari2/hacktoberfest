@@ -89,15 +89,18 @@ final class TextInputPanelManager {
         installClickOutsideMonitor()
     }
 
-    private func hideTextInputPanel() {
+    private func hideTextInputPanel(isSubmitting: Bool = false) {
         textInputPanel?.orderOut(nil)
         removeClickOutsideMonitor()
+        if !isSubmitting {
+            companionManager.cancelTypedInstruction()
+        }
     }
 
     /// Hides the box before sending, so it isn't in the screenshot and
     /// doesn't cover anything Coach might point at.
     private func submitTypedInstruction(_ typedInstruction: String) {
-        hideTextInputPanel()
+        hideTextInputPanel(isSubmitting: true)
         companionManager.submitTypedInstruction(typedInstruction)
     }
 

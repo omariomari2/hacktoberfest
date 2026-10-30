@@ -49,3 +49,18 @@ Report each step as PASS, FAIL or BLOCKED, with the console lines starting with 
 - Quiet mode: show Coach's answer as text under the box instead of speaking it, for libraries and classrooms.
 - A setting for choosing the hotkey.
 - Once computer use (PR #3) is merged, typing "yes" confirms a pending click with no extra work, because confirmation is checked in the same function.
+
+## Review fixes
+
+Typed answers now fall back to the retained macOS speech synthesizer when ElevenLabs fails (including the deployed backend returning 503). This speaks the actual model answer. Opening the composer or starting push-to-talk stops fallback speech. App shutdown also stops it; transient hiding waits for local speech to finish.
+
+Opening the composer now clears the cancelled response task and resets voice state. Escape, shortcut-toggle and outside-click dismissal restore the transient hide lifecycle; sending does not schedule a competing hide timer.
+
+Required Mac regression checks (not runnable on Windows):
+1. Leave ElevenLabs unset; type a question and verify the actual answer is spoken by the macOS voice, not a credits error.
+2. While Gemma is processing, open the composer and press Escape: spinner clears and transient cursor fades normally.
+3. Repeat cancellation by outside click and Option+Space.
+4. Start push-to-talk or reopen the composer during native fallback speech: speech stops immediately.
+5. Submit a question: composer hides before capture and the overlay stays through the answer.
+
+No native build or runtime pass is claimed until these checks run on the Mac through Xcode.
