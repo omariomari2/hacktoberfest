@@ -87,6 +87,31 @@ final class CompanionManager: ObservableObject {
     /// The currently running AI response task, if any. Cancelled when the user
     /// speaks again so a new response can begin immediately.
     private var currentResponseTask: Task<Void, Never>?
+    private let typedResponseSpeechSynthesizer = NSSpeechSynthesizer()
+
+    // MARK: - Computer Use
+
+    /// Computer use (the model clicking for the user) is off unless explicitly
+    /// enabled on this Mac, because it acts on the user's behalf:
+    ///   defaults write com.yourcompany.leanring-buddy isComputerUseEnabled -bool true
+    /// When off, the prompt never mentions clicking and [CLICK:...] tags are ignored.
+    private var isComputerUseEnabled: Bool {
+        UserDefaults.standard.bool(forKey: "isComputerUseEnabled")
+    }
+
+    /// A click the model proposed that is waiting for the user to say "yes".
+    /// Any other utterance, or waiting too long, discards it without clicking.
+    private var pendingComputerUseClick: ComputerUsePendingClick?
+    private var pendingComputerUseTarget: ComputerUseClickExecutor.VerifiedTarget?
+
+    /// Waits for Coach to finish speaking the click question, then restarts
+    /// the pending click's confirmation window. Cancelled when the user
+    /// speaks again, since that utterance decides the pending click.
+    private var computerUseConfirmationWindowRestartTask: Task<Void, Never>?
+
+    /// Speaks computer-use status lines when ElevenLabs is unavailable. Kept
+    /// as a property so the synthesizer isn't deallocated mid-sentence.
+    private let computerUseFallbackSpeechSynthesizer = NSSpeechSynthesizer()
 
     private var shortcutTransitionCancellable: AnyCancellable?
     private var voiceStateCancellable: AnyCancellable?
@@ -174,7 +199,7 @@ final class CompanionManager: ObservableObject {
 
     func start() {
         refreshAllPermissions()
-        print("🔑 Clicky start — accessibility: \(hasAccessibilityPermission), screen: \(hasScreenRecordingPermission), mic: \(hasMicrophonePermission), screenContent: \(hasScreenContentPermission), onboarded: \(hasCompletedOnboarding)")
+        print("🔑 HeyCoach start — accessibility: \(hasAccessibilityPermission), screen: \(hasScreenRecordingPermission), mic: \(hasMicrophonePermission), screenContent: \(hasScreenContentPermission), onboarded: \(hasCompletedOnboarding)")
         startPermissionPolling()
         bindVoiceStateObservation()
         bindAudioPowerLevel()
@@ -240,7 +265,7 @@ final class CompanionManager: ObservableObject {
     private func startOnboardingMusic() {
         stopOnboardingMusic()
         guard let musicURL = Bundle.main.url(forResource: "ff", withExtension: "mp3") else {
-            print("⚠️ Clicky: ff.mp3 not found in bundle")
+            print("⚠️ HeyCoach: ff.mp3 not found in bundle")
             return
         }
 
@@ -255,7 +280,7 @@ final class CompanionManager: ObservableObject {
                 self?.fadeOutOnboardingMusic()
             }
         } catch {
-            print("⚠️ Clicky: Failed to play onboarding music: \(error)")
+            print("⚠️ HeyCoach: Failed to play onboarding music: \(error)")
         }
     }
 
@@ -288,6 +313,7 @@ final class CompanionManager: ObservableObject {
     }
 
     func stop() {
+        typedResponseSpeechSynthesizer.stopSpeaking()
         globalPushToTalkShortcutMonitor.stop()
         buddyDictationManager.cancelCurrentDictation()
         overlayWindowManager.hideOverlay()
@@ -295,6 +321,10 @@ final class CompanionManager: ObservableObject {
 
         currentResponseTask?.cancel()
         currentResponseTask = nil
+        pendingComputerUseClick = nil
+        pendingComputerUseTarget = nil
+        computerUseConfirmationWindowRestartTask?.cancel()
+        computerUseConfirmationWindowRestartTask = nil
         shortcutTransitionCancellable?.cancel()
         voiceStateCancellable?.cancel()
         audioPowerCancellable?.cancel()
@@ -494,6 +524,7 @@ final class CompanionManager: ObservableObject {
             // Cancel any in-progress response and TTS from a previous utterance
             currentResponseTask?.cancel()
             elevenLabsTTSClient.stopPlayback()
+            typedResponseSpeechSynthesizer.stopSpeaking()
             clearDetectedElementLocation()
 
             // Dismiss the onboarding prompt if it's showing
@@ -539,13 +570,73 @@ final class CompanionManager: ObservableObject {
         }
     }
 
+    // MARK: - Typed Instructions
+
+    /// Whether the text-input hotkey should open the box right now. A typed
+    /// instruction still needs a screenshot, so it requires the same setup as
+    /// push-to-talk, and it shouldn't interrupt an in-progress recording.
+    var canAcceptTypedInstruction: Bool {
+        hasCompletedOnboarding
+            && allPermissionsGranted
+            && !showOnboardingVideo
+            && !buddyDictationManager.isDictationInProgress
+    }
+
+    /// Called when the text-input box opens. Mirrors pressing push-to-talk:
+    /// stops any answer being spoken, clears a previous pointer target, and
+    /// closes the menu bar panel so it doesn't cover the screen.
+    func prepareForTypedInstruction() {
+        transientHideTask?.cancel()
+        transientHideTask = nil
+
+        currentResponseTask?.cancel()
+        currentResponseTask = nil
+        voiceState = .idle
+        elevenLabsTTSClient.stopPlayback()
+        typedResponseSpeechSynthesizer.stopSpeaking()
+        clearDetectedElementLocation()
+
+        NotificationCenter.default.post(name: .clickyDismissPanel, object: nil)
+    }
+
+    /// Sends a typed instruction through exactly the same pipeline as a voice
+    /// transcript (screenshot → model → pointing → spoken answer), so typed
+    /// and spoken turns share one conversation history.
+    func submitTypedInstruction(_ typedInstruction: String) {
+        guard canAcceptTypedInstruction else { return }
+        let trimmedTypedInstruction = typedInstruction.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedTypedInstruction.isEmpty else {
+            scheduleTransientHideIfNeeded()
+            return
+        }
+
+        // If the cursor is hidden, bring it back transiently so the answer
+        // can still point at things, the same way push-to-talk does.
+        if !isClickyCursorEnabled && !isOverlayVisible {
+            overlayWindowManager.hasShownOverlayBefore = true
+            overlayWindowManager.showOverlay(onScreens: NSScreen.screens, companionManager: self)
+            isOverlayVisible = true
+        }
+
+        lastTranscript = trimmedTypedInstruction
+        print("⌨️ Typed instruction submitted (\(trimmedTypedInstruction.count) characters)")
+        sendTranscriptToClaudeWithScreenshot(transcript: trimmedTypedInstruction, isTypedInstruction: true)
+    }
+
+    /// Closing an empty/cancelled composer must restore the idle overlay lifecycle.
+    func cancelTypedInstruction() {
+        guard !buddyDictationManager.isDictationInProgress, currentResponseTask == nil else { return }
+        voiceState = .idle
+        scheduleTransientHideIfNeeded()
+    }
+
     // MARK: - Companion Prompt
 
     private static let companionVoiceResponseSystemPrompt = """
-    you're coach, a friendly always-on companion that lives in the user's menu bar. the user just spoke to you via push-to-talk and you can see their screen(s). your reply will be spoken aloud via text-to-speech, so write the way you'd actually talk. this is an ongoing conversation — you remember everything they've said before.
+    you're heycoach, a friendly always-on companion that lives in the user's menu bar. the user just spoke to you via push-to-talk and you can see their screen(s). your reply will be spoken aloud via text-to-speech, so write the way you'd actually talk. this is an ongoing conversation — you remember everything they've said before.
 
     rules:
-    - your name is coach. users may address you as hey coach while using push-to-talk; respond naturally without treating it as a separate command.
+    - your name is heycoach. users may address you as hey coach while using push-to-talk; respond naturally without treating it as a separate command.
     - default to one or two sentences. be direct and dense. BUT if the user asks you to explain more, go deeper, or elaborate, then go all out — give a thorough, detailed explanation with no length limit.
     - all lowercase, casual, warm. no emojis.
     - write for the ear, not the eye. short sentences. no lists, bullet points, markdown, or formatting — just natural speech.
@@ -577,6 +668,26 @@ final class CompanionManager: ObservableObject {
     - element is on screen 2 (not where cursor is): "that's over on your other monitor — see the terminal window? [POINT:400,300:terminal:screen2]"
     """
 
+    /// Appended to the system prompt only when computer use is enabled.
+    private static let computerUseSystemPromptAddition = """
+
+
+    clicking for the user:
+    you can also click for the user, but only when they explicitly ask you to do it for them — like "click that", "open it for me", "double click the file", or "right click it". if they only ask where something is or how to do something, point instead of clicking.
+
+    to click, end your response with a click tag INSTEAD of a point tag: [CLICK:kind:x,y:label] where kind is left, double, or right. use the same coordinate rules as pointing, including :screenN at the end when the element is on a different screen. use double for opening files and folders in finder, and right to open a context menu. request at most one click per response.
+
+    when you click, the click tag replaces the point tag. do NOT also append [POINT:...] or [POINT:none] — the click tag must be the very last thing in your response.
+
+    in your spoken text, say plainly what you're about to click. the app will ask the user to confirm before anything is clicked, so don't claim you already clicked it.
+
+    never request clicks in password fields, payment or checkout pages, system settings, or security and permission prompts — explain where to click instead.
+
+    examples:
+    - user says "open the downloads folder for me" and it's in the finder sidebar: "i'll open your downloads folder from the sidebar. [CLICK:left:88,214:downloads]"
+    - user says "double click the report pdf": "i'll open report dot pdf for you. [CLICK:double:640,388:report pdf]"
+    """
+
     // MARK: - AI Response Pipeline
 
     /// Captures a screenshot, sends it along with the transcript to Claude,
@@ -584,9 +695,31 @@ final class CompanionManager: ObservableObject {
     /// the spinner/processing state until TTS audio begins playing.
     /// Claude's response may include a [POINT:x,y:label] tag which triggers
     /// the buddy to fly to that element on screen.
-    private func sendTranscriptToClaudeWithScreenshot(transcript: String) {
+    private func sendTranscriptToClaudeWithScreenshot(transcript: String, isTypedInstruction: Bool = false) {
         currentResponseTask?.cancel()
         elevenLabsTTSClient.stopPlayback()
+        computerUseConfirmationWindowRestartTask?.cancel()
+        computerUseConfirmationWindowRestartTask = nil
+
+        // A pending click is only performed if this utterance is a plain "yes"
+        // within the confirmation window, and computer use is still enabled
+        // (it can be turned off while a click is waiting). Anything else
+        // discards it and is handled as a normal new question.
+        if let pendingComputerUseClick {
+            self.pendingComputerUseClick = nil
+            let verifiedTarget = pendingComputerUseTarget
+            pendingComputerUseTarget = nil
+            let isStillWithinConfirmationWindow = !pendingComputerUseClick.hasExpired(asOf: Date())
+            let isComputerUseStillEnabled = isComputerUseEnabled
+            if isComputerUseStillEnabled
+                && isStillWithinConfirmationWindow
+                && ComputerUseConfirmation.isConfirmation(transcript) {
+                performConfirmedComputerUseClick(pendingComputerUseClick, confirmationTranscript: transcript, verifiedTarget: verifiedTarget)
+                return
+            }
+            print("🖱️ Pending click discarded (expired: \(!isStillWithinConfirmationWindow), computer use enabled: \(isComputerUseStillEnabled))")
+        }
+        typedResponseSpeechSynthesizer.stopSpeaking()
 
         currentResponseTask = Task {
             // Stay in processing (spinner) state — no streaming text displayed
@@ -613,7 +746,9 @@ final class CompanionManager: ObservableObject {
 
                 let (fullResponseText, _) = try await claudeAPI.analyzeImageStreaming(
                     images: labeledImages,
-                    systemPrompt: Self.companionVoiceResponseSystemPrompt,
+                    systemPrompt: isComputerUseEnabled
+                        ? Self.companionVoiceResponseSystemPrompt + Self.computerUseSystemPromptAddition
+                        : Self.companionVoiceResponseSystemPrompt,
                     conversationHistory: historyForAPI,
                     userPrompt: transcript,
                     onTextChunk: { _ in
@@ -623,15 +758,34 @@ final class CompanionManager: ObservableObject {
 
                 guard !Task.isCancelled else { return }
 
+                // Pull out a trailing [CLICK:...] tag first (only when computer
+                // use is on), then parse the remaining text for [POINT:...] as before.
+                var responseTextWithoutClickTag = fullResponseText
+                var computerUseClickRequest: ComputerUseClickRequest? = nil
+                if isComputerUseEnabled {
+                    let clickTagParseResult = ComputerUseTagParser.parseClickRequest(from: fullResponseText)
+                    responseTextWithoutClickTag = clickTagParseResult.remainingText
+                    computerUseClickRequest = clickTagParseResult.clickRequest
+                }
+
                 // Parse the [POINT:...] tag from Claude's response
-                let parseResult = Self.parsePointingCoordinates(from: fullResponseText)
-                let spokenText = parseResult.spokenText
+                let parseResult = Self.parsePointingCoordinates(from: responseTextWithoutClickTag)
+                // Any tag text still left (for example a [CLICK:...] tag that
+                // wasn't at the end, or a click tag while computer use is off)
+                // is removed so it's never spoken or saved to history.
+                var spokenText = ComputerUseTagParser.removingStrayCoordinateTags(from: parseResult.spokenText)
+
+                // A requested click is also pointed at, so the user sees the
+                // exact target before confirming it.
+                let pointingCoordinate = computerUseClickRequest?.screenshotCoordinate ?? parseResult.coordinate
+                let pointingScreenNumber = computerUseClickRequest != nil ? computerUseClickRequest?.screenNumber : parseResult.screenNumber
+                let pointingElementLabel = computerUseClickRequest != nil ? computerUseClickRequest?.elementLabel : parseResult.elementLabel
 
                 // Handle element pointing if Claude returned coordinates.
                 // Switch to idle BEFORE setting the location so the triangle
                 // becomes visible and can fly to the target. Without this, the
                 // spinner hides the triangle and the flight animation is invisible.
-                let hasPointCoordinate = parseResult.coordinate != nil
+                let hasPointCoordinate = pointingCoordinate != nil
                 if hasPointCoordinate {
                     voiceState = .idle
                 }
@@ -639,64 +793,63 @@ final class CompanionManager: ObservableObject {
                 // Pick the screen capture matching Claude's screen number,
                 // falling back to the cursor screen if not specified.
                 let targetScreenCapture: CompanionScreenCapture? = {
-                    if let screenNumber = parseResult.screenNumber,
+                    if let screenNumber = pointingScreenNumber,
                        screenNumber >= 1 && screenNumber <= screenCaptures.count {
                         return screenCaptures[screenNumber - 1]
                     }
                     return screenCaptures.first(where: { $0.isCursorScreen })
                 }()
 
-                if let pointCoordinate = parseResult.coordinate,
+                if let pointCoordinate = pointingCoordinate,
                    let targetScreenCapture {
                     // Claude's coordinates are in the screenshot's pixel space
                     // (top-left origin, e.g. 1280x831). Scale to the display's
                     // point space (e.g. 1512x982), then convert to AppKit global coords.
-                    let screenshotWidth = CGFloat(targetScreenCapture.screenshotWidthInPixels)
-                    let screenshotHeight = CGFloat(targetScreenCapture.screenshotHeightInPixels)
-                    let displayWidth = CGFloat(targetScreenCapture.displayWidthInPoints)
-                    let displayHeight = CGFloat(targetScreenCapture.displayHeightInPoints)
-                    let displayFrame = targetScreenCapture.displayFrame
-
-                    // Clamp to screenshot coordinate space
-                    let clampedX = max(0, min(pointCoordinate.x, screenshotWidth))
-                    let clampedY = max(0, min(pointCoordinate.y, screenshotHeight))
-
-                    // Scale from screenshot pixels to display points
-                    let displayLocalX = clampedX * (displayWidth / screenshotWidth)
-                    let displayLocalY = clampedY * (displayHeight / screenshotHeight)
-
-                    // Convert from top-left origin (screenshot) to bottom-left origin (AppKit)
-                    let appKitY = displayHeight - displayLocalY
-
-                    // Convert display-local coords to global screen coords
-                    let globalLocation = CGPoint(
-                        x: displayLocalX + displayFrame.origin.x,
-                        y: appKitY + displayFrame.origin.y
+                    let globalLocation = ScreenCoordinateConversion.appKitGlobalLocation(
+                        screenshotCoordinate: pointCoordinate,
+                        screenshotWidthInPixels: CGFloat(targetScreenCapture.screenshotWidthInPixels),
+                        screenshotHeightInPixels: CGFloat(targetScreenCapture.screenshotHeightInPixels),
+                        displayWidthInPoints: CGFloat(targetScreenCapture.displayWidthInPoints),
+                        displayHeightInPoints: CGFloat(targetScreenCapture.displayHeightInPoints),
+                        displayFrame: targetScreenCapture.displayFrame
                     )
 
+                    if let computerUseClickRequest {
+                        pendingComputerUseTarget = try await ComputerUseClickExecutor.captureVerifiedTarget(
+                            at: globalLocation, overlayWindowManager: overlayWindowManager
+                        )
+                        try Task.checkCancellation()
+                        pendingComputerUseClick = ComputerUsePendingClick(
+                            clickKind: computerUseClickRequest.clickKind,
+                            elementLabel: computerUseClickRequest.elementLabel,
+                            appKitGlobalLocation: globalLocation,
+                            createdDate: Date()
+                        )
+                        let targetDescription = computerUseClickRequest.elementLabel ?? "this"
+                        detectedElementBubbleText = "\(computerUseClickRequest.clickKind.spokenDescription) \(targetDescription)? say yes"
+                        spokenText += " say yes to confirm."
+                        print("🖱️ Click proposed: \(computerUseClickRequest.clickKind.rawValue) → \"\(targetDescription)\", awaiting confirmation")
+                    } else {
+                        detectedElementBubbleText = nil
+                    }
+
                     detectedElementScreenLocation = globalLocation
-                    detectedElementDisplayFrame = displayFrame
-                    ClickyAnalytics.trackElementPointed(elementLabel: parseResult.elementLabel)
-                    print("🎯 Element pointing: (\(Int(pointCoordinate.x)), \(Int(pointCoordinate.y))) → \"\(parseResult.elementLabel ?? "element")\"")
+                    detectedElementDisplayFrame = targetScreenCapture.displayFrame
+                    ClickyAnalytics.trackElementPointed(elementLabel: pointingElementLabel)
+                    print("🎯 Element pointing: (\(Int(pointCoordinate.x)), \(Int(pointCoordinate.y))) → \"\(pointingElementLabel ?? "element")\"")
                 } else {
-                    print("🎯 Element pointing: \(parseResult.elementLabel ?? "no element")")
+                    print("🎯 Element pointing: \(pointingElementLabel ?? "no element")")
                 }
 
                 // Save this exchange to conversation history (with the point tag
                 // stripped so it doesn't confuse future context)
-                conversationHistory.append((
-                    userTranscript: transcript,
-                    assistantResponse: spokenText
-                ))
-
-                // Keep only the last 10 exchanges to avoid unbounded context growth
-                if conversationHistory.count > 10 {
-                    conversationHistory.removeFirst(conversationHistory.count - 10)
-                }
+                appendExchangeToConversationHistory(userTranscript: transcript, assistantResponse: spokenText)
 
                 print("🧠 Conversation history: \(conversationHistory.count) exchanges")
 
-                ClickyAnalytics.trackAIResponseReceived(response: spokenText)
+                if !isTypedInstruction {
+                    ClickyAnalytics.trackAIResponseReceived(response: spokenText)
+                }
 
                 // Play the response via TTS. Keep the spinner (processing state)
                 // until the audio actually starts playing, then switch to responding.
@@ -708,12 +861,28 @@ final class CompanionManager: ObservableObject {
                     } catch {
                         ClickyAnalytics.trackTTSError(error: error.localizedDescription)
                         print("⚠️ ElevenLabs TTS error: \(error)")
-                        speakCreditsErrorFallback()
+                        guard !Task.isCancelled else { return }
+                        if isTypedInstruction {
+                            typedResponseSpeechSynthesizer.startSpeaking(spokenText)
+                            voiceState = .responding
+                        } else {
+                            speakCreditsErrorFallback()
+                        }
                     }
+                }
+
+                // The confirmation window should count from when Coach stops
+                // asking, not from when the answer arrived, or a long spoken
+                // answer would leave the user little time to say "yes".
+                // Skipped if the user already spoke again, since a newer
+                // response now owns any pending click.
+                if pendingComputerUseClick != nil && !Task.isCancelled {
+                    restartComputerUseConfirmationWindowWhenSpeechFinishes()
                 }
             } catch is CancellationError {
                 // User spoke again — response was interrupted
             } catch {
+                guard !Task.isCancelled else { return }
                 ClickyAnalytics.trackResponseError(error: error.localizedDescription)
                 print("⚠️ Companion response error: \(error)")
                 speakCreditsErrorFallback()
@@ -723,6 +892,36 @@ final class CompanionManager: ObservableObject {
                 voiceState = .idle
                 scheduleTransientHideIfNeeded()
             }
+        }
+    }
+
+    /// Appends one exchange to the conversation history sent with future
+    /// requests, keeping only the last 10 exchanges to avoid unbounded
+    /// context growth.
+    private func appendExchangeToConversationHistory(userTranscript: String, assistantResponse: String) {
+        conversationHistory.append((
+            userTranscript: userTranscript,
+            assistantResponse: assistantResponse
+        ))
+
+        if conversationHistory.count > 10 {
+            conversationHistory.removeFirst(conversationHistory.count - 10)
+        }
+    }
+
+    /// Restarts the pending click's 20-second confirmation window once
+    /// Coach's spoken question has finished playing, using the same
+    /// isPlaying polling as scheduleTransientHideIfNeeded.
+    private func restartComputerUseConfirmationWindowWhenSpeechFinishes() {
+        computerUseConfirmationWindowRestartTask?.cancel()
+        computerUseConfirmationWindowRestartTask = Task {
+            while elevenLabsTTSClient.isPlaying {
+                try? await Task.sleep(nanoseconds: 200_000_000)
+                guard !Task.isCancelled else { return }
+            }
+            guard !Task.isCancelled,
+                  let pendingClickAwaitingConfirmation = self.pendingComputerUseClick else { return }
+            self.pendingComputerUseClick = pendingClickAwaitingConfirmation.restartingConfirmationWindow(at: Date())
         }
     }
 
@@ -736,7 +935,7 @@ final class CompanionManager: ObservableObject {
         transientHideTask?.cancel()
         transientHideTask = Task {
             // Wait for TTS audio to finish playing
-            while elevenLabsTTSClient.isPlaying {
+            while elevenLabsTTSClient.isPlaying || typedResponseSpeechSynthesizer.isSpeaking {
                 try? await Task.sleep(nanoseconds: 200_000_000)
                 guard !Task.isCancelled else { return }
             }
@@ -760,10 +959,71 @@ final class CompanionManager: ObservableObject {
     /// credits run out. Uses NSSpeechSynthesizer so it works even when
     /// ElevenLabs is down.
     private func speakCreditsErrorFallback() {
-        let utterance = "I'm all out of credits. Please DM Farza and tell him to bring me back to life."
+        let utterance = "HeyCoach couldn't connect to its AI or voice service. Please check the connection and try again."
         let synthesizer = NSSpeechSynthesizer()
         synthesizer.startSpeaking(utterance)
         voiceState = .responding
+    }
+
+    // MARK: - Computer Use Execution
+
+    /// Performs a click the user just confirmed out loud, then says whether
+    /// it happened. The click is never retried; a refusal is spoken instead.
+    private func performConfirmedComputerUseClick(
+        _ confirmedComputerUseClick: ComputerUsePendingClick,
+        confirmationTranscript: String,
+        verifiedTarget: ComputerUseClickExecutor.VerifiedTarget?
+    ) {
+        currentResponseTask = Task {
+            voiceState = .processing
+
+            let targetDescription = confirmedComputerUseClick.elementLabel ?? "that"
+            let spokenResult: String
+            do {
+                guard let verifiedTarget else { throw ComputerUseClickRefusal.targetElementCouldNotBeVerified }
+                try await ComputerUseClickExecutor.performClick(
+                    clickKind: confirmedComputerUseClick.clickKind,
+                    atAppKitGlobalLocation: confirmedComputerUseClick.appKitGlobalLocation,
+                    overlayWindowManager: overlayWindowManager,
+                    expectedTarget: verifiedTarget
+                )
+                spokenResult = "done, i \(confirmedComputerUseClick.clickKind.spokenDescription)ed \(targetDescription)."
+                print("🖱️ Click performed: \(confirmedComputerUseClick.clickKind.rawValue) → \"\(targetDescription)\"")
+            } catch let clickRefusal as ComputerUseClickRefusal {
+                spokenResult = clickRefusal.spokenExplanation
+                print("🖱️ Click refused: \(clickRefusal)")
+            } catch is CancellationError {
+                return
+            } catch {
+                spokenResult = "something went wrong, so i didn't click anything."
+                print("⚠️ Click error: \(error)")
+            }
+
+            guard !Task.isCancelled else { return }
+
+            appendExchangeToConversationHistory(userTranscript: confirmationTranscript, assistantResponse: spokenResult)
+
+            await speakComputerUseStatus(spokenResult)
+
+            if !Task.isCancelled {
+                voiceState = .idle
+                scheduleTransientHideIfNeeded()
+            }
+        }
+    }
+
+    /// Speaks a short computer-use status line. Falls back to the macOS
+    /// system voice speaking the same text if ElevenLabs is unavailable,
+    /// so the user always hears whether the click actually happened.
+    private func speakComputerUseStatus(_ statusText: String) async {
+        do {
+            try await elevenLabsTTSClient.speakText(statusText)
+            voiceState = .responding
+        } catch {
+            print("⚠️ ElevenLabs TTS error for computer-use status: \(error)")
+            computerUseFallbackSpeechSynthesizer.startSpeaking(statusText)
+            voiceState = .responding
+        }
     }
 
     // MARK: - Point Tag Parsing
@@ -949,7 +1209,7 @@ final class CompanionManager: ObservableObject {
     // MARK: - Onboarding Demo Interaction
 
     private static let onboardingDemoSystemPrompt = """
-    you're coach, a small blue cursor buddy living on the user's screen. you're showing off during onboarding — look at their screen and find ONE specific, concrete thing to point at. pick something with a clear name or identity: a specific app icon (say its name), a specific word or phrase of text you can read, a specific filename, a specific button label, a specific tab title, a specific image you can describe. do NOT point at vague things like "a window" or "some text" — be specific about exactly what you see.
+    you're heycoach, a small blue cursor buddy living on the user's screen. you're showing off during onboarding — look at their screen and find ONE specific, concrete thing to point at. pick something with a clear name or identity: a specific app icon (say its name), a specific word or phrase of text you can read, a specific filename, a specific button label, a specific tab title, a specific image you can describe. do NOT point at vague things like "a window" or "some text" — be specific about exactly what you see.
 
     make a short quirky 3-6 word observation about the specific thing you picked — something fun, playful, or curious that shows you actually read/recognized it. no emojis ever. NEVER quote or repeat text you see on screen — just react to it. keep it to 6 words max, no exceptions.
 
@@ -997,20 +1257,14 @@ final class CompanionManager: ObservableObject {
                     return
                 }
 
-                let screenshotWidth = CGFloat(cursorScreenCapture.screenshotWidthInPixels)
-                let screenshotHeight = CGFloat(cursorScreenCapture.screenshotHeightInPixels)
-                let displayWidth = CGFloat(cursorScreenCapture.displayWidthInPoints)
-                let displayHeight = CGFloat(cursorScreenCapture.displayHeightInPoints)
                 let displayFrame = cursorScreenCapture.displayFrame
-
-                let clampedX = max(0, min(pointCoordinate.x, screenshotWidth))
-                let clampedY = max(0, min(pointCoordinate.y, screenshotHeight))
-                let displayLocalX = clampedX * (displayWidth / screenshotWidth)
-                let displayLocalY = clampedY * (displayHeight / screenshotHeight)
-                let appKitY = displayHeight - displayLocalY
-                let globalLocation = CGPoint(
-                    x: displayLocalX + displayFrame.origin.x,
-                    y: appKitY + displayFrame.origin.y
+                let globalLocation = ScreenCoordinateConversion.appKitGlobalLocation(
+                    screenshotCoordinate: pointCoordinate,
+                    screenshotWidthInPixels: CGFloat(cursorScreenCapture.screenshotWidthInPixels),
+                    screenshotHeightInPixels: CGFloat(cursorScreenCapture.screenshotHeightInPixels),
+                    displayWidthInPoints: CGFloat(cursorScreenCapture.displayWidthInPoints),
+                    displayHeightInPoints: CGFloat(cursorScreenCapture.displayHeightInPoints),
+                    displayFrame: displayFrame
                 )
 
                 // Set custom bubble text so the pointing animation uses Claude's

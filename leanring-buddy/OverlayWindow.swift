@@ -170,7 +170,7 @@ struct BlueCursorView: View {
     private let onboardingVideoPlayerWidth: CGFloat = 330
     private let onboardingVideoPlayerHeight: CGFloat = 186
 
-    private let fullWelcomeMessage = "hey! i'm coach"
+    private let fullWelcomeMessage = "hey! i'm heycoach"
 
     private let navigationPointerPhrases = [
         "right here!",
@@ -836,6 +836,25 @@ class OverlayWindowManager {
 
     func isShowingOverlay() -> Bool {
         return !overlayWindows.isEmpty
+    }
+
+    /// Takes the overlay windows off screen without destroying them, so an
+    /// Accessibility hit test sees the app underneath instead of Coach's
+    /// full-screen overlay. Always pair with restoreTemporarilyHiddenOverlayWindows().
+    func temporarilyHideOverlayWindows() {
+        for window in overlayWindows {
+            window.orderOut(nil)
+        }
+    }
+
+    /// Puts back the overlay windows taken off screen by
+    /// temporarilyHideOverlayWindows(). Windows removed in the meantime
+    /// (by hideOverlay or fadeOutAndHideOverlay) are no longer in the list,
+    /// so they stay hidden.
+    func restoreTemporarilyHiddenOverlayWindows() {
+        for window in overlayWindows {
+            window.orderFrontRegardless()
+        }
     }
 }
 
