@@ -43,6 +43,45 @@ nonisolated enum ComputerUseClickRefusal: Error, Equatable {
 }
 
 enum ComputerUseClickExecutor {
+    struct VerifiedTarget {
+        let element: AXUIElement
+        let position: CGPoint
+        let size: CGSize
+    }
+
+    static func captureVerifiedTarget(at location: CGPoint, overlayWindowManager: OverlayWindowManager) async throws -> VerifiedTarget {
+        guard AXIsProcessTrusted(), let height = NSScreen.screens.first?.frame.height else {
+            throw ComputerUseClickRefusal.accessibilityPermissionMissing
+        }
+        let point = ScreenCoordinateConversion.coreGraphicsGlobalLocation(
+            fromAppKitGlobalLocation: location, primaryDisplayHeightInPoints: height
+        )
+        overlayWindowManager.temporarilyHideOverlayWindows()
+        defer { overlayWindowManager.restoreTemporarilyHiddenOverlayWindows() }
+        try await Task.sleep(nanoseconds: delayForOverlayToLeaveScreenInNanoseconds)
+        let system = AXUIElementCreateSystemWide()
+        var element: AXUIElement?
+        guard AXUIElementCopyElementAtPosition(system, Float(point.x), Float(point.y), &element) == .success,
+              let element else { throw ComputerUseClickRefusal.targetElementCouldNotBeVerified }
+        if let refusal = refusalForElement(element) { throw refusal }
+        var positionValue: CFTypeRef?
+        var sizeValue: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXPositionAttribute as CFString, &positionValue) == .success,
+              AXUIElementCopyAttributeValue(element, kAXSizeAttribute as CFString, &sizeValue) == .success,
+              let positionValue, let sizeValue,
+              CFGetTypeID(positionValue) == AXValueGetTypeID(),
+              CFGetTypeID(sizeValue) == AXValueGetTypeID() else {
+            throw ComputerUseClickRefusal.targetElementCouldNotBeVerified
+        }
+        var position = CGPoint.zero
+        var size = CGSize.zero
+        guard AXValueGetValue(positionValue as! AXValue, .cgPoint, &position),
+              AXValueGetValue(sizeValue as! AXValue, .cgSize, &size) else {
+            throw ComputerUseClickRefusal.targetElementCouldNotBeVerified
+        }
+        return VerifiedTarget(element: element, position: position, size: size)
+    }
+
 
     /// Short pauses between synthetic events. Some apps ignore a mouse-down
     /// that arrives in the same instant as the move, and double-clicks need
@@ -67,7 +106,8 @@ enum ComputerUseClickExecutor {
     static func performClick(
         clickKind: ComputerUseClickKind,
         atAppKitGlobalLocation appKitGlobalLocation: CGPoint,
-        overlayWindowManager: OverlayWindowManager
+        overlayWindowManager: OverlayWindowManager,
+        expectedTarget: VerifiedTarget
     ) async throws {
         guard AXIsProcessTrusted() else {
             throw ComputerUseClickRefusal.accessibilityPermissionMissing
@@ -86,28 +126,19 @@ enum ComputerUseClickExecutor {
             primaryDisplayHeightInPoints: primaryDisplayHeightInPoints
         )
 
-        // Coach's full-screen overlay sits above every other window. It is
-        // click-through, but the Accessibility hit test can still land on it
-        // and then never see the real element underneath. Take the overlay
-        // off screen only while the check runs, then put it back.
-        overlayWindowManager.temporarilyHideOverlayWindows()
-        do {
-            try await Task.sleep(nanoseconds: delayForOverlayToLeaveScreenInNanoseconds)
-        } catch {
-            overlayWindowManager.restoreTemporarilyHiddenOverlayWindows()
-            throw error
-        }
-        let refusalForTargetElement = refusalForElementAtTarget(coreGraphicsLocation: coreGraphicsLocation)
-        overlayWindowManager.restoreTemporarilyHiddenOverlayWindows()
-
-        if let refusalForTargetElement {
-            throw refusalForTargetElement
-        }
-
         let eventSource = CGEventSource(stateID: .hidSystemState)
 
         try postMouseEvent(type: .mouseMoved, button: .left, clickState: 0, at: coreGraphicsLocation, eventSource: eventSource)
         try await Task.sleep(nanoseconds: delayAfterMovingCursorInNanoseconds)
+
+        let currentTarget = try await captureVerifiedTarget(
+            at: appKitGlobalLocation, overlayWindowManager: overlayWindowManager
+        )
+        guard CFEqual(expectedTarget.element, currentTarget.element),
+              expectedTarget.position == currentTarget.position,
+              expectedTarget.size == currentTarget.size else {
+            throw ComputerUseClickRefusal.targetElementCouldNotBeVerified
+        }
 
         switch clickKind {
         case .left:
@@ -150,25 +181,7 @@ enum ComputerUseClickExecutor {
     /// target point right now, and refuses password fields and sensitive apps.
     /// Fails closed: whenever the element under the point can't be
     /// identified, the click is refused instead of performed unchecked.
-    private static func refusalForElementAtTarget(coreGraphicsLocation: CGPoint) -> ComputerUseClickRefusal? {
-        let systemWideAccessibilityElement = AXUIElementCreateSystemWide()
-        // Set on the system-wide element, the timeout applies to every
-        // Accessibility request this app makes, including the hit test below.
-        _ = AXUIElementSetMessagingTimeout(systemWideAccessibilityElement, accessibilityMessagingTimeoutInSeconds)
-
-        var elementAtTarget: AXUIElement?
-        let elementLookupResult = AXUIElementCopyElementAtPosition(
-            systemWideAccessibilityElement,
-            Float(coreGraphicsLocation.x),
-            Float(coreGraphicsLocation.y),
-            &elementAtTarget
-        )
-        // No answer (including a timeout from a hung app) means we can't rule
-        // out a password field or a sensitive app.
-        guard elementLookupResult == .success, let elementAtTarget else {
-            return .targetElementCouldNotBeVerified
-        }
-
+    private static func refusalForElement(_ elementAtTarget: AXUIElement) -> ComputerUseClickRefusal? {
         var targetProcessIdentifier: pid_t = 0
         let processIdentifierLookupResult = AXUIElementGetPid(elementAtTarget, &targetProcessIdentifier)
         guard processIdentifierLookupResult == .success, targetProcessIdentifier != 0 else {

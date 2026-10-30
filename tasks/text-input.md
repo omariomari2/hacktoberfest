@@ -64,3 +64,9 @@ Required Mac regression checks (not runnable on Windows):
 5. Submit a question: composer hides before capture and the overlay stays through the answer.
 
 No native build or runtime pass is claimed until these checks run on the Mac through Xcode.
+
+## Combined integration review
+
+Text input, HeyCoach branding and computer use have been combined. Composer dismissal observes push-to-talk transitions, submission rechecks readiness, local/global clicks dismiss it, and typed input/answers are excluded from raw analytics. Click proposals snapshot the actual Accessibility element and geometry; execution refuses when identity or geometry changes. Lookup failures remain refusals. Computer use stays off by default.
+
+Verification on Windows: backend 49/49 tests and TypeScript checks pass; plist/feed XML and product/module/test-host checks pass. Native Xcode compilation and keyboard/audio/Accessibility execution remain unverified; use the Mac GUI test checklists before enabling computer use for the demo. Existing Wrangler dev dependencies have audit findings; the deployed Node backend has no runtime npm dependencies.

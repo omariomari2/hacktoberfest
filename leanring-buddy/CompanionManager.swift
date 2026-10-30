@@ -102,6 +102,7 @@ final class CompanionManager: ObservableObject {
     /// A click the model proposed that is waiting for the user to say "yes".
     /// Any other utterance, or waiting too long, discards it without clicking.
     private var pendingComputerUseClick: ComputerUsePendingClick?
+    private var pendingComputerUseTarget: ComputerUseClickExecutor.VerifiedTarget?
 
     /// Waits for Coach to finish speaking the click question, then restarts
     /// the pending click's confirmation window. Cancelled when the user
@@ -321,6 +322,7 @@ final class CompanionManager: ObservableObject {
         currentResponseTask?.cancel()
         currentResponseTask = nil
         pendingComputerUseClick = nil
+        pendingComputerUseTarget = nil
         computerUseConfirmationWindowRestartTask?.cancel()
         computerUseConfirmationWindowRestartTask = nil
         shortcutTransitionCancellable?.cancel()
@@ -705,12 +707,14 @@ final class CompanionManager: ObservableObject {
         // discards it and is handled as a normal new question.
         if let pendingComputerUseClick {
             self.pendingComputerUseClick = nil
+            let verifiedTarget = pendingComputerUseTarget
+            pendingComputerUseTarget = nil
             let isStillWithinConfirmationWindow = !pendingComputerUseClick.hasExpired(asOf: Date())
             let isComputerUseStillEnabled = isComputerUseEnabled
             if isComputerUseStillEnabled
                 && isStillWithinConfirmationWindow
                 && ComputerUseConfirmation.isConfirmation(transcript) {
-                performConfirmedComputerUseClick(pendingComputerUseClick, confirmationTranscript: transcript)
+                performConfirmedComputerUseClick(pendingComputerUseClick, confirmationTranscript: transcript, verifiedTarget: verifiedTarget)
                 return
             }
             print("🖱️ Pending click discarded (expired: \(!isStillWithinConfirmationWindow), computer use enabled: \(isComputerUseStillEnabled))")
@@ -811,6 +815,10 @@ final class CompanionManager: ObservableObject {
                     )
 
                     if let computerUseClickRequest {
+                        pendingComputerUseTarget = try await ComputerUseClickExecutor.captureVerifiedTarget(
+                            at: globalLocation, overlayWindowManager: overlayWindowManager
+                        )
+                        try Task.checkCancellation()
                         pendingComputerUseClick = ComputerUsePendingClick(
                             clickKind: computerUseClickRequest.clickKind,
                             elementLabel: computerUseClickRequest.elementLabel,
@@ -963,7 +971,8 @@ final class CompanionManager: ObservableObject {
     /// it happened. The click is never retried; a refusal is spoken instead.
     private func performConfirmedComputerUseClick(
         _ confirmedComputerUseClick: ComputerUsePendingClick,
-        confirmationTranscript: String
+        confirmationTranscript: String,
+        verifiedTarget: ComputerUseClickExecutor.VerifiedTarget?
     ) {
         currentResponseTask = Task {
             voiceState = .processing
@@ -971,10 +980,12 @@ final class CompanionManager: ObservableObject {
             let targetDescription = confirmedComputerUseClick.elementLabel ?? "that"
             let spokenResult: String
             do {
+                guard let verifiedTarget else { throw ComputerUseClickRefusal.targetElementCouldNotBeVerified }
                 try await ComputerUseClickExecutor.performClick(
                     clickKind: confirmedComputerUseClick.clickKind,
                     atAppKitGlobalLocation: confirmedComputerUseClick.appKitGlobalLocation,
-                    overlayWindowManager: overlayWindowManager
+                    overlayWindowManager: overlayWindowManager,
+                    expectedTarget: verifiedTarget
                 )
                 spokenResult = "done, i \(confirmedComputerUseClick.clickKind.spokenDescription)ed \(targetDescription)."
                 print("🖱️ Click performed: \(confirmedComputerUseClick.clickKind.rawValue) → \"\(targetDescription)\"")
