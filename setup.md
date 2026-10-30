@@ -1,4 +1,10 @@
-# macOS agent handoff: build and test Clicky
+# Coach branding and activation
+
+The hackathon companion is now named **Coach** (based on upstream Clicky). Keep the existing `leanring-buddy` project and scheme names and the upstream MIT attribution. Visible app product/display names, companion labels and persona use Coach. Hold the existing push-to-talk shortcut and say "hey coach" followed by your question. No always-listening wake-word detector is implemented or intended for this milestone.
+
+The rename needs an Xcode GUI build on the demo Mac. Preserve its current bundle identifier and user-default keys so signing/configuration do not change unnecessarily. Internal Clicky class names and backend environment keys remain compatible with the existing handoff.
+
+# macOS agent handoff: build and test Coach
 
 You are the coding agent on the teammate's Mac. This document is self-contained; you do not need the originating chat or its Windows filesystem. Your immediate job is to get this native app building and verify the Mac interaction pipeline, then connect the team's backend when it is ready. A successful build alone does not verify AI functionality.
 
@@ -14,7 +20,7 @@ Setup does not authorize publishing releases, creating paid resources, changing 
 
 ### Team context and ownership
 
-- We are adapting upstream Clicky for a hackathon, developing together, and testing the native app on this Mac. The first milestone is general-purpose Clicky: capture the screen, ask a question, receive a Gemma answer, and verify pointing. Student-specific features come later; do not add them during baseline setup.
+- We are adapting upstream Clicky as Coach for a hackathon, developing together, and testing the native app on this Mac. The first milestone is general-purpose Coach: capture the screen, ask a question, receive a Gemma answer, and verify pointing. Student-specific features come later; do not add them during baseline setup.
 - Gemma and DigitalOcean are the priority platforms. Snowflake is lower priority; the originating agent uses its Browser UI because MCP did not work. Do not assume your Mac agent has those connections or credentials.
 - The Windows-side agent verified a direct hosted Gemma text request, but has not built the native app. Your Mac build and runtime checks are essential.
 - First inspect what is already implemented. If Gemma/backend changes are absent, finish the native baseline and report the backend dependency to the team. Do not silently deploy the upstream Cloudflare/Claude alternative or duplicate another teammate's backend work.
