@@ -247,3 +247,9 @@ test("fills logging metadata without payload contents", async () => {
   await handleGemmaChat(chatRequest(swiftClientBody()), env, { fetchImpl, meta });
   assert.deepEqual(meta, { imageCount: 1, imageBytes: 13, stream: false });
 });
+
+
+test("short companion replies explicitly minimize thinking", () => {
+  const translated = translateChatRequest(swiftClientBody());
+  assert.deepEqual(translated.geminiRequest.generationConfig.thinkingConfig, { thinkingLevel: "minimal" });
+});

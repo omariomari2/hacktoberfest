@@ -10,6 +10,7 @@
  *   node --env-file-if-exists=.env scripts/smoke-gemma.ts [prepend|instruction]
  */
 
+import { verifyPoint } from "./point-check.ts";
 import { deflateSync } from "node:zlib";
 import { handleGemmaChat } from "../src/gemma.ts";
 
@@ -73,7 +74,9 @@ const body = {
   system:
     "You help users find things on their screen. Answer in one short sentence. " +
     "When you refer to an element, append [POINT:x,y:label:screen1] using pixel " +
-    `coordinates in the screenshot (origin top-left, ${WIDTH}x${HEIGHT}).`,
+    `coordinates in the screenshot (origin top-left, ${WIDTH}x${HEIGHT}). ` +
+    `Output actual pixels, not normalized coordinates. If locating on a 0-1000 grid, ` +
+    `convert x to x * ${WIDTH}/1000 and y to y * ${HEIGHT}/1000 before writing POINT.`,
   messages: [
     {
       role: "user",
@@ -104,7 +107,7 @@ if (point) {
 } else {
   console.log("No POINT tag in the answer");
 }
-process.exitCode = response.ok ? 0 : 1;
+process.exitCode = response.ok && verifyPoint(text, BUTTON) ? 0 : 1;
 
 // Streaming: same request, measure time to first visible delta.
 if (response.ok) {
@@ -140,5 +143,6 @@ if (response.ok) {
   console.log(`First delta after ${firstDeltaMs} ms, ${deltaCount} deltas, total ${Date.now() - streamStarted} ms`);
   console.log(`Streamed text: ${streamedText}`);
   console.log(`Other events: ${otherEvents.join(" ")}`);
-  if (!otherEvents.includes(JSON.stringify({ type: "message_stop" }))) process.exitCode = 1;
+  if (!streamResponse.ok || !verifyPoint(streamedText, BUTTON) ||
+      !otherEvents.includes(JSON.stringify({ type: "message_stop" }))) process.exitCode = 1;
 }

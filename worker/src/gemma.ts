@@ -64,7 +64,7 @@ interface GeminiContent {
 export interface GeminiRequest {
   systemInstruction?: { parts: { text: string }[] };
   contents: GeminiContent[];
-  generationConfig: { maxOutputTokens: number };
+  generationConfig: { maxOutputTokens: number; thinkingConfig: { thinkingLevel: "minimal" } };
 }
 
 /**
@@ -163,7 +163,10 @@ export function translateChatRequest(
 
   const geminiRequest: GeminiRequest = {
     contents,
-    generationConfig: { maxOutputTokens: clampMaxTokens(maxTokens) },
+    generationConfig: {
+      maxOutputTokens: clampMaxTokens(maxTokens),
+      thinkingConfig: { thinkingLevel: "minimal" },
+    },
   };
 
   if (typeof system === "string" && system.length > 0) {

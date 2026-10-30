@@ -90,3 +90,12 @@ The script draws a synthetic 640×400 screen with one red button at a known posi
 - **Task 6:** Before provisioning anything, decide the DigitalOcean region, size, monthly cost and HTTPS hostname/TLS approach. Supply `GEMINI_API_KEY` and `CLICKY_APP_TOKEN` through the platform's secret store.
 - **Task 7:** `ClaudeAPI.swift` doesn't send the `Authorization` header yet. Until it does, the deployed backend will answer 401. The app should also read `ClickyBackendBaseURL`/`ClickyAppToken`, show Gemma instead of the Claude picker, and surface stream `error` events.
 - **Team review:** Have the Mac teammate review `tasks/contract.md` (the checkpoint after task 5).
+
+
+## Review fixes and live verification
+
+- Explicitly set Gemma thinkingLevel to minimal so short companion replies do not spend the response budget on hidden thinking.
+- Smoke checks now fail for absent, wrong-screen or out-of-target POINT tags in both answer modes. Added regression coverage for settings and target validation.
+- The fixture prompt explicitly requires conversion from normalized coordinates to screenshot pixels. This is a fixture instruction, not a claim that production Mac pointing is solved.
+- Verification on Windows: 49 tests pass; npm run build passes. Live Gemma screenshot smoke test returned HTTP 200 in both modes, nonstream point (517,300), stream point (518,301), both inside the red button. First visible stream delta arrived at 793 ms; message_stop received.
+- Mac app authentication, native speech, real display coordinate mapping and DigitalOcean deployment remain pending. No Swift source or production infrastructure changed in these fixes.
