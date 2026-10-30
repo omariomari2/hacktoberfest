@@ -105,3 +105,40 @@ if (point) {
   console.log("No POINT tag in the answer");
 }
 process.exitCode = response.ok ? 0 : 1;
+
+// Streaming: same request, measure time to first visible delta.
+if (response.ok) {
+  const streamStarted = Date.now();
+  const streamResponse = await handleGemmaChat(
+    new Request("http://localhost/chat", { method: "POST", body: JSON.stringify({ ...body, stream: true }) }),
+    { GEMINI_API_KEY: process.env.GEMINI_API_KEY, GEMMA_SYSTEM_PROMPT_MODE: mode }
+  );
+  console.log(`\nStreaming HTTP ${streamResponse.status}`);
+  const reader = streamResponse.body!.getReader();
+  const decoder = new TextDecoder();
+  let buffered = "";
+  let streamedText = "";
+  let deltaCount = 0;
+  let firstDeltaMs: number | null = null;
+  const otherEvents: string[] = [];
+  for (let chunk = await reader.read(); !chunk.done; chunk = await reader.read()) {
+    buffered += decoder.decode(chunk.value, { stream: true });
+    const lines = buffered.split("\n");
+    buffered = lines.pop() ?? "";
+    for (const line of lines) {
+      if (!line.startsWith("data: ")) continue;
+      const event = JSON.parse(line.slice(6));
+      if (event.type === "content_block_delta") {
+        firstDeltaMs ??= Date.now() - streamStarted;
+        deltaCount += 1;
+        streamedText += event.delta.text;
+      } else {
+        otherEvents.push(JSON.stringify(event));
+      }
+    }
+  }
+  console.log(`First delta after ${firstDeltaMs} ms, ${deltaCount} deltas, total ${Date.now() - streamStarted} ms`);
+  console.log(`Streamed text: ${streamedText}`);
+  console.log(`Other events: ${otherEvents.join(" ")}`);
+  if (!otherEvents.includes(JSON.stringify({ type: "message_stop" }))) process.exitCode = 1;
+}

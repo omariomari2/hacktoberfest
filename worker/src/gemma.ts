@@ -277,6 +277,8 @@ export interface GemmaEnv {
 export interface ChatHandlerOptions {
   fetchImpl?: typeof fetch;
   timeoutMs?: number;
+  /** Aborts the upstream call, e.g. when the client disconnects. */
+  signal?: AbortSignal;
   /** Filled with non-sensitive request facts for logging. */
   meta?: { imageCount?: number; imageBytes?: number; stream?: boolean };
 }
@@ -331,19 +333,35 @@ async function handleGemmaChatOrThrow(
     options.meta.stream = translated.stream;
   }
 
-  if (translated.stream) {
-    throw new ChatError(400, "invalid_request", "Streaming is not available yet");
-  }
+  // Aborts the upstream call when the client disconnects or the stream is cancelled.
+  const upstreamAbort = new AbortController();
+  if (options.signal?.aborted) upstreamAbort.abort();
+  options.signal?.addEventListener("abort", () => upstreamAbort.abort(), { once: true });
 
   const upstreamResponse = await callGemini(
-    "generateContent",
+    translated.stream ? "streamGenerateContent" : "generateContent",
     translated.geminiRequest,
     env.GEMINI_API_KEY,
-    options
+    options,
+    upstreamAbort.signal
   );
   if (!upstreamResponse.ok) {
     await upstreamResponse.body?.cancel();
     throw mapUpstreamError(upstreamResponse.status);
+  }
+
+  if (translated.stream) {
+    if (!upstreamResponse.body) {
+      throw new ChatError(502, "upstream_error", "The model returned an unreadable response");
+    }
+    return new Response(geminiSseToAnthropicSse(upstreamResponse.body, upstreamAbort), {
+      status: 200,
+      headers: {
+        "content-type": "text/event-stream",
+        "cache-control": "no-cache",
+        "x-clicky-model": GEMMA_MODEL,
+      },
+    });
   }
 
   let geminiJson: unknown;
@@ -371,23 +389,167 @@ async function callGemini(
   method: "generateContent" | "streamGenerateContent",
   geminiRequest: GeminiRequest,
   apiKey: string,
-  options: ChatHandlerOptions
+  options: ChatHandlerOptions,
+  abortSignal: AbortSignal
 ): Promise<Response> {
   const fetchImpl = options.fetchImpl ?? fetch;
   const query = method === "streamGenerateContent" ? "?alt=sse" : "";
+  // The timeout also bounds reading the streamed body, not just the headers.
+  const signal = AbortSignal.any([
+    abortSignal,
+    AbortSignal.timeout(options.timeoutMs ?? CHAT_LIMITS.upstreamTimeoutMs),
+  ]);
   try {
     return await fetchImpl(`${GEMINI_API_BASE}/${GEMMA_MODEL}:${method}${query}`, {
       method: "POST",
       headers: { "content-type": "application/json", "x-goog-api-key": apiKey },
       body: JSON.stringify(geminiRequest),
-      signal: AbortSignal.timeout(options.timeoutMs ?? CHAT_LIMITS.upstreamTimeoutMs),
+      signal,
     });
   } catch (error) {
-    if (error instanceof Error && error.name === "TimeoutError") {
-      throw new ChatError(504, "upstream_timeout", "The model took too long to respond");
-    }
-    throw new ChatError(502, "upstream_error", "Could not reach the model service");
+    throw upstreamFailure(error);
   }
+}
+
+function upstreamFailure(error: unknown): ChatError {
+  if (error instanceof Error && error.name === "TimeoutError") {
+    return new ChatError(504, "upstream_timeout", "The model took too long to respond");
+  }
+  return new ChatError(502, "upstream_error", "Could not reach the model service");
+}
+
+// --- Streaming -------------------------------------------------------------
+
+/**
+ * Incremental SSE parser. Accepts bytes split at arbitrary boundaries
+ * (including inside multi-byte characters and CRLF pairs) and calls
+ * `onData` once per complete event with its joined data lines.
+ */
+export function createSseParser(onData: (data: string) => void) {
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  const drain = () => {
+    // A trailing lone "\r" stays in the buffer until its "\n" arrives.
+    buffer = buffer.replace(/\r\n/g, "\n");
+    let boundary: number;
+    while ((boundary = buffer.indexOf("\n\n")) !== -1) {
+      const event = buffer.slice(0, boundary);
+      buffer = buffer.slice(boundary + 2);
+      const dataLines = event
+        .split("\n")
+        .filter((line) => line.startsWith("data:"))
+        .map((line) => line.slice(5).replace(/^ /, ""));
+      if (dataLines.length > 0) onData(dataLines.join("\n"));
+    }
+  };
+
+  return {
+    push(chunk: Uint8Array) {
+      buffer += decoder.decode(chunk, { stream: true });
+      drain();
+    },
+    end() {
+      buffer += decoder.decode() + "\n\n";
+      drain();
+    },
+  };
+}
+
+const encoder = new TextEncoder();
+
+function sseEvent(payload: unknown): Uint8Array {
+  return encoder.encode(`data: ${JSON.stringify(payload)}\n\n`);
+}
+
+function sseError(error: ChatError): Uint8Array {
+  return sseEvent({ type: "error", error: { type: error.type, message: error.message } });
+}
+
+/**
+ * Re-emits Gemini streamGenerateContent SSE as the Anthropic
+ * content_block_delta events ClaudeAPI.swift parses. Text is forwarded as
+ * soon as each upstream event completes; reads are pull-driven so a slow
+ * client applies backpressure to the upstream connection.
+ */
+export function geminiSseToAnthropicSse(
+  upstreamBody: ReadableStream<Uint8Array>,
+  upstreamAbort: AbortController
+): ReadableStream<Uint8Array> {
+  const reader = upstreamBody.getReader();
+  let pending: Uint8Array[] = [];
+  let emittedText = false;
+  let failed = false;
+
+  const parser = createSseParser((data) => {
+    if (failed) return;
+    let event: unknown;
+    try {
+      event = JSON.parse(data);
+    } catch {
+      failed = true;
+      pending.push(sseError(new ChatError(502, "upstream_error", "The model returned an unreadable response")));
+      return;
+    }
+    if (isRecord(event) && event.error !== undefined) {
+      failed = true;
+      const status = isRecord(event.error) && typeof event.error.code === "number" ? event.error.code : 500;
+      pending.push(sseError(mapUpstreamError(status)));
+      return;
+    }
+    const text = extractVisibleText(event);
+    if (text.length > 0) {
+      emittedText = true;
+      pending.push(sseEvent({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text } }));
+    }
+  });
+
+  const finish = (controller: ReadableStreamDefaultController<Uint8Array>) => {
+    if (!failed) {
+      controller.enqueue(
+        emittedText
+          ? sseEvent({ type: "message_stop" })
+          : sseError(new ChatError(502, "upstream_error", "The model returned no answer"))
+      );
+    }
+    controller.close();
+  };
+
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        while (pending.length === 0) {
+          const { done, value } = await reader.read();
+          if (done) {
+            parser.end();
+            for (const chunk of pending) controller.enqueue(chunk);
+            pending = [];
+            finish(controller);
+            return;
+          }
+          parser.push(value);
+          if (failed) break;
+        }
+      } catch (error) {
+        if (!failed) {
+          failed = true;
+          pending.push(sseError(upstreamFailure(error)));
+        }
+      }
+
+      for (const chunk of pending) controller.enqueue(chunk);
+      pending = [];
+      if (failed) {
+        upstreamAbort.abort();
+        reader.cancel().catch(() => {});
+        controller.close();
+      }
+    },
+    cancel() {
+      upstreamAbort.abort();
+      return reader.cancel().catch(() => {});
+    },
+  });
 }
 
 // --- Helpers ---------------------------------------------------------------
