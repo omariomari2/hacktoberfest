@@ -1,4 +1,6 @@
-# Clicky - Agent Instructions
+# Coach - Agent Instructions
+
+The hackathon app is Coach, based on upstream Clicky. Use Coach in user-visible text and companion prompts. Keep the legacy project/scheme names, bundle identifiers, internal Clicky identifiers, configuration keys, and MIT attribution. Activation remains push-to-talk; "hey coach" is conversational input, not an always-listening wake word. See `setup.md` for the team handoff.
 
 <!-- This is the single source of truth for all AI coding agents. CLAUDE.md is a symlink to this file. -->
 <!-- AGENTS.md spec: https://github.com/agentsmd/agents.md — supported by Claude Code, Cursor, Copilot, Gemini CLI, and others. -->

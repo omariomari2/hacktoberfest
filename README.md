@@ -1,3 +1,9 @@
+# Coach — hackathon companion
+
+Coach is our adaptation of the MIT-licensed Clicky source below. Start with [setup.md](setup.md) for the team's Mac build instructions and current backend setup. Hold push-to-talk and say "hey coach" followed by your question; continuous wake-word listening is not implemented.
+
+The original project's announcement and attribution follow. Its download links refer to upstream HeyClicky, not this team's Coach build.
+
 ## Get HeyClicky for Mac and Windows
 
 The official app is **[HeyClicky](https://www.heyclicky.com/)**, an AI buddy for Mac and Windows, made by me and the team.
