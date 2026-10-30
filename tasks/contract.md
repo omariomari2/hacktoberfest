@@ -1,6 +1,6 @@
 # Mac ↔ backend contract (frozen in task 1)
 
-Implementation branch: `patrick`, created from published hackathon `origin/main` (02a25e6). Never merge the original upstream-history `main` into it.
+Implementation branch: `feature/gemma-backend`, created from published hackathon `origin/main` (02a25e6). Never merge the original upstream-history `main` into it.
 
 Change this contract only by agreement between the backend owner (this PC) and the Mac teammate. Record the change in this file in the same commit.
 

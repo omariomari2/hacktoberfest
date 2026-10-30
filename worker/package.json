@@ -3,15 +3,20 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "wrangler dev",
-    "deploy": "wrangler deploy",
+    "start": "node src/main.ts",
+    "build": "tsc",
     "test": "node --test \"test/*.test.ts\"",
     "typecheck": "tsc",
-    "smoke:gemma": "node --env-file-if-exists=.env scripts/smoke-gemma.ts"
+    "smoke:gemma": "node --env-file-if-exists=.env scripts/smoke-gemma.ts",
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
   },
   "devDependencies": {
     "@types/node": "^24.19.2",
     "typescript": "^5.9.3",
     "wrangler": "^3.0.0"
+  },
+  "engines": {
+    "node": ">=22.18"
   }
 }
