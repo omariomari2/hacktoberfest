@@ -60,6 +60,7 @@ enum ComputerUseClickExecutor {
         defer { overlayWindowManager.restoreTemporarilyHiddenOverlayWindows() }
         try await Task.sleep(nanoseconds: delayForOverlayToLeaveScreenInNanoseconds)
         let system = AXUIElementCreateSystemWide()
+        _ = AXUIElementSetMessagingTimeout(system, accessibilityMessagingTimeoutInSeconds)
         var element: AXUIElement?
         guard AXUIElementCopyElementAtPosition(system, Float(point.x), Float(point.y), &element) == .success,
               let element else { throw ComputerUseClickRefusal.targetElementCouldNotBeVerified }
