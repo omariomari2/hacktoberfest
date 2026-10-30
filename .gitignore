@@ -1,0 +1,17 @@
+worker/node_modules/
+worker/.dev.vars
+.DS_Store
+*.xcuserstate
+build/
+releases/
+.claude/
+coding-plans/
+
+# Local secrets and tooling
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+node_modules/
+DerivedData/
